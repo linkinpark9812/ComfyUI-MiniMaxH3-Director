@@ -1,54 +1,233 @@
 // In-node live preview for MiniMax H3 Preview Override.
-// The Python side sends one animated WebP per sampled step over the "minimax_h3_preview"
-// event; we drop it into a DOM widget on the node and show a small status line.
+// Server-backed step history is independent of live animation playback.
+// Only run identities and links live in the browser; archives survive clearing the node.
 
 const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 const NODE_TYPE = "MiniMaxH3PreviewOverrideCS";
 const IDLE_TEXT = "waiting for sample…";
+const CONTROL_STYLE = {
+  background: "#292929", color: "#ddd", border: "1px solid #555", borderRadius: "3px",
+  padding: "4px 6px", font: "inherit", cursor: "pointer",
+};
+
+function element(tag, styles = {}, text = "") {
+  const el = document.createElement(tag);
+  Object.assign(el.style, styles);
+  el.textContent = text;
+  return el;
+}
+
+function archiveURL(panel, kind, step, download = false) {
+  const query = new URLSearchParams({ folder: panel.folder, run_id: panel.runId });
+  if (step != null) query.set("step", String(step));
+  if (download) query.set("download", "1");
+  return `/minimax_director/preview_archive/${kind}?${query}`;
+}
 
 function buildPanel() {
-  const root = document.createElement("div");
-  Object.assign(root.style, {
-    display: "flex", flexDirection: "column", gap: "4px",
-    boxSizing: "border-box", width: "100%", height: "100%",
+  const root = element("div", {
+    display: "flex", flexDirection: "column", gap: "6px", minHeight: "0",
+    boxSizing: "border-box", width: "100%", height: "100%", overflow: "hidden",
+    color: "#ccc", fontSize: "11px",
   });
-
-  const frame = document.createElement("div");
-  Object.assign(frame.style, {
-    position: "relative", width: "100%", minHeight: "160px", flex: "1",
+  const body = element("div", { display: "flex", gap: "8px", flex: "1", minHeight: "0" });
+  const frame = element("div", {
+    position: "relative", minWidth: "0", flex: "1", minHeight: "0",
     background: "#141414", border: "1px solid #3a3a3a", borderRadius: "6px",
     display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",
   });
-
-  const img = document.createElement("img");
-  Object.assign(img.style, {
-    maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
-    display: "none", imageRendering: "auto",
+  const img = element("img", { width: "100%", height: "100%", objectFit: "contain", display: "none" });
+  img.alt = "Sampling preview";
+  const idle = element("div", { color: "#999", padding: "8px" }, IDLE_TEXT);
+  frame.append(img, idle);
+  const sidebar = element("div", {
+    display: "flex", flexDirection: "column", gap: "4px", width: "165px",
+    maxWidth: "45%", minHeight: "0", flexShrink: "0",
   });
-
-  const idle = document.createElement("div");
-  idle.textContent = IDLE_TEXT;
-  Object.assign(idle.style, { color: "#6a6a6a", fontSize: "11px", fontStyle: "italic" });
-
-  frame.appendChild(img);
-  frame.appendChild(idle);
-
-  const status = document.createElement("div");
-  Object.assign(status.style, {
-    display: "flex", justifyContent: "space-between", gap: "8px",
-    color: "#8a8a8a", fontSize: "10px", fontFamily: "monospace", padding: "0 2px",
+  const live = element("button", CONTROL_STYLE, "Live");
+  live.type = "button";
+  live.title = "Resume the latest live preview";
+  const list = element("div", { overflowY: "auto", flex: "1", minHeight: "0" });
+  list.setAttribute("aria-label", "Saved sampling steps");
+  const zip = element("a", { ...CONTROL_STYLE, color: "#8bcaff", textAlign: "center",
+    textDecoration: "none" }, "Download all (.zip)");
+  zip.setAttribute("role", "button");
+  zip.addEventListener("click", (event) => {
+    if (zip.getAttribute("aria-disabled") === "true") event.preventDefault();
   });
-  const left = document.createElement("span");
-  const right = document.createElement("span");
-  left.textContent = "idle";
-  status.appendChild(left);
-  status.appendChild(right);
+  zip.addEventListener("keydown", (event) => {
+    if (event.key === " ") {
+      event.preventDefault();
+      zip.click();
+    }
+  });
+  sidebar.append(live, list, zip);
+  body.append(frame, sidebar);
+  const status = element("div", { display: "flex", gap: "8px", justifyContent: "space-between",
+    fontFamily: "monospace", fontSize: "10px", flexWrap: "wrap" });
+  const left = element("span");
+  const right = element("span");
+  status.append(left, right);
+  const summary = element("div", { overflowWrap: "anywhere" });
+  summary.setAttribute("aria-live", "polite");
+  root.append(body, status, summary);
+  // Interacting with a control must not drag the graph node or zoom the canvas.
+  for (const event of ["pointerdown", "mousedown", "dblclick", "wheel"]) {
+    sidebar.addEventListener(event, (e) => e.stopPropagation());
+  }
+  const panel = { root, img, idle, left, right, summary, live, list, zip, disposed: false };
+  live.addEventListener("click", () => {
+    panel.selected = null;
+    if (panel.latestDisplay) showPreview(panel, panel.latestDisplay);
+    live.setAttribute("aria-pressed", "true");
+  });
+  resetPanel(panel);
+  return panel;
+}
 
-  root.appendChild(frame);
-  root.appendChild(status);
-  return { root, img, idle, left, right };
+function setZip(panel, ready, label = "Download all (.zip)") {
+  panel.zip.textContent = label;
+  panel.zip.setAttribute("aria-disabled", String(!ready));
+  panel.zip.tabIndex = ready ? 0 : -1;
+  panel.zip.style.opacity = ready ? "1" : "0.5";
+  if (ready) {
+    panel.zip.href = api.apiURL(archiveURL(panel, "zip"));
+    panel.zip.download = `${panel.folder}.zip`;
+  } else {
+    panel.zip.removeAttribute("href");
+    panel.zip.removeAttribute("download");
+  }
+}
+
+function resetPanel(panel, promptId = null) {
+  clearTimeout(panel.retryTimer);
+  panel.controller?.abort();
+  Object.assign(panel, { promptId, runId: null, folder: null, sequence: 0,
+    artifacts: new Map(), selected: null, latestDisplay: null, terminal: false,
+    error: null, retries: 0, controller: null, retryTimer: null, target: "node" });
+  panel.list.replaceChildren();
+  panel.img.removeAttribute("src");
+  panel.img.style.display = "none";
+  panel.idle.style.display = "block";
+  panel.idle.textContent = IDLE_TEXT;
+  panel.left.textContent = promptId ? "waiting…" : "idle";
+  panel.right.textContent = "";
+  panel.summary.textContent = "No saved steps";
+  panel.live.setAttribute("aria-pressed", "true");
+  setZip(panel, false);
+}
+
+function showPreview(panel, data) {
+  const artifact = data.artifact || data;
+  const src = data.webp ? `data:image/webp;base64,${data.webp}`
+    : api.apiURL(archiveURL(panel, "step", artifact.step));
+  if (panel.img.getAttribute("src") !== src) panel.img.src = src;
+  panel.img.style.display = "block";
+  panel.idle.style.display = "none";
+  const rate = Number(artifact.fps || 0);
+  const source = Number(artifact.source_fps || rate);
+  const fps = Math.abs(source - rate) > 0.05
+    ? `${rate.toFixed(1)}fps of ${source.toFixed(0)} · true speed`
+    : `${rate.toFixed(1)}fps${artifact.playback === "source fps" ? " · source" : ""}`;
+  panel.left.textContent = `step ${artifact.step}/${artifact.total_steps} · ${artifact.frames}f @${fps}`;
+  panel.right.textContent = `render ${((artifact.ms || 0) / 1000).toFixed(2)}s · ${(artifact.mode || "").split(" ")[0]}`;
+}
+
+function addArtifact(panel, artifact) {
+  if (!Number.isInteger(artifact.step) || panel.artifacts.has(artifact.step)) return;
+  panel.artifacts.set(artifact.step, artifact);
+  const row = element("div", { display: "flex", gap: "4px", alignItems: "center", padding: "3px 0" });
+  row.dataset.step = String(artifact.step);
+  const select = element("button", { ...CONTROL_STYLE, flex: "1", minWidth: "0",
+    textAlign: "left", overflow: "hidden", textOverflow: "ellipsis" }, artifact.filename);
+  select.type = "button";
+  select.title = `Inspect step ${artifact.step}`;
+  select.addEventListener("click", () => {
+    panel.selected = artifact.step;
+    panel.live.setAttribute("aria-pressed", "false");
+    showPreview(panel, artifact);
+  });
+  const download = element("a", { ...CONTROL_STYLE, color: "#8bcaff", textDecoration: "none" }, "↓");
+  download.href = api.apiURL(archiveURL(panel, "step", artifact.step, true));
+  download.download = artifact.filename;
+  download.title = `Download ${artifact.filename}`;
+  download.setAttribute("aria-label", download.title);
+  row.append(select, download);
+  const following = [...panel.list.children].find((r) => Number(r.dataset.step) > artifact.step);
+  panel.list.insertBefore(row, following || null);
+}
+
+function updateSummary(panel, data = {}) {
+  if (data.error) panel.error = data.error;
+  const labels = { running: "Sampling", completed: "Completed", interrupted: "Canceled", failed: "Failed" };
+  const status = labels[data.sampling_status] || (panel.terminal ? "Finished" : "Sampling");
+  const failures = data.capture_failures?.length || 0;
+  panel.summary.textContent = `${panel.folder || "Preview"} · ${status} · ${panel.artifacts.size} steps saved` +
+    (failures ? ` · ${failures} capture failures` : "") + (panel.error ? ` · ${panel.error}` : "");
+}
+
+function applyManifest(panel, data) {
+  panel.error = data.error || null;
+  for (const artifact of data.artifacts || []) addArtifact(panel, artifact);
+  panel.target = data.settings?.preview_target || panel.target;
+  if (data.sampling_status && data.sampling_status !== "running") {
+    panel.terminal = true;
+    clearTimeout(panel.retryTimer);
+    setZip(panel, data.archive_state === "ready",
+      data.archive_state === "ready" ? "Download all (.zip)" : "ZIP unavailable");
+    const latest = [...panel.artifacts.values()].sort((a, b) => b.step - a.step)[0];
+    if (latest && panel.target !== "sampler (VHS)") {
+      panel.latestDisplay = latest;
+      if (panel.selected == null) showPreview(panel, latest);
+    }
+  }
+  updateSummary(panel, data);
+}
+
+async function reconcile(panel) {
+  if (!panel.runId || panel.disposed) return;
+  const runId = panel.runId;
+  panel.controller?.abort();
+  const controller = new AbortController();
+  panel.controller = controller;
+  try {
+    const response = await api.fetchApi(archiveURL(panel, "manifest"), { signal: controller.signal });
+    if (!response.ok) throw new Error(`Archive status unavailable (${response.status})`);
+    const data = await response.json();
+    if (panel.disposed || panel.runId !== runId || controller.signal.aborted) return;
+    // A response requested while recording may arrive after the finished event.
+    if (!panel.terminal || data.sampling_status !== "running") applyManifest(panel, data);
+  } catch (error) {
+    if (error.name === "AbortError" || panel.disposed || panel.runId !== runId) return;
+    panel.error = error.message;
+    updateSummary(panel);
+  }
+  if (!panel.terminal && panel.runId === runId && !panel.disposed && panel.retries++ < 30) {
+    clearTimeout(panel.retryTimer);
+    panel.retryTimer = setTimeout(() => reconcile(panel), 2000);
+  }
+}
+
+function eventPanel(data) {
+  const node = app.graph?._nodes?.find((n) => String(n.id) === String(data.node_id));
+  const panel = node?._mmxPreview;
+  if (!panel || panel.disposed || !data.run_id) return null;
+  if (panel.promptId && panel.promptId !== data.prompt_id) return null;
+  if (panel.runId !== data.run_id) {
+    // IDs begin with a UTC timestamp. A late event from an older invocation cannot
+    // replace the current invocation when one patched model feeds multiple samplers.
+    if (panel.runId && data.run_id < panel.runId) return null;
+    resetPanel(panel, data.prompt_id);
+    panel.runId = data.run_id;
+    panel.folder = data.folder_name;
+    if (data.kind !== "started") void reconcile(panel);
+  }
+  if (data.sequence <= panel.sequence) return null;
+  if (panel.sequence && data.sequence > panel.sequence + 1) void reconcile(panel);
+  panel.sequence = data.sequence;
+  return panel;
 }
 
 app.registerExtension({
@@ -80,7 +259,7 @@ app.registerExtension({
       });
       widget.serialize = false;
 
-      if (this.size[0] < 340) this.size[0] = 340;
+      if (this.size[0] < 560) this.size[0] = 560;
       if (this.size[1] < 520) this.size[1] = 520;
     };
 
@@ -126,8 +305,9 @@ app.registerExtension({
 
     const onRemoved = nodeType.prototype.onRemoved;
     nodeType.prototype.onRemoved = function () {
-      if (this._mmxPreview?.img?.src?.startsWith("blob:")) {
-        URL.revokeObjectURL(this._mmxPreview.img.src);
+      if (this._mmxPreview) {
+        resetPanel(this._mmxPreview);
+        this._mmxPreview.disposed = true;
       }
       this._mmxPreview = null;
       return onRemoved?.apply(this, arguments);
@@ -135,39 +315,57 @@ app.registerExtension({
   },
 
   async setup() {
-    api.addEventListener("minimax_h3_preview", (event) => {
-      const d = event.detail || {};
-      // node ids are strings server-side and numbers in the graph — compare loosely
-      const node = app.graph?._nodes?.find((n) => String(n.id) === String(d.node_id));
-      const panel = node?._mmxPreview;
-      if (!panel || !d.webp) return;
-
-      panel.img.src = "data:image/webp;base64," + d.webp;
-      panel.img.style.display = "block";
-      panel.idle.style.display = "none";
-      const rate = Number(d.fps);
-      const src = Number(d.source_fps);
-      // A rate below the shot's own is not a fault, it is the "true speed" trade: the
-      // sampled frames are spread over the clip's real length. Say which of the two you
-      // are looking at, or the number reads as a setting being ignored.
-      const slowed = Number.isFinite(src) && Math.abs(src - rate) > 0.05;
-      const fpsText = slowed
-        ? `${rate.toFixed(1)}fps of ${src.toFixed(0)} · true speed`
-        : `${rate.toFixed(rate % 1 ? 1 : 0)}fps${d.playback === "source fps" ? " · source" : ""}`;
-      panel.left.textContent = `step ${d.step}/${d.total_steps} · ${d.frames}f @${fpsText}`;
-      // server-side cost of building this preview, not anything the browser spent
-      const cost = Number(d.ms) >= 1000 ? `${(d.ms / 1000).toFixed(1)}s` : `${d.ms}ms`;
-      panel.right.textContent = `render ${cost} · ${d.mode ? d.mode.split(" ")[0] : ""}`;
-      node.setDirtyCanvas?.(true, false);
+    api.addEventListener("minimax_h3_preview_archive", ({ detail: data }) => {
+      if (!data) return;
+      const panel = eventPanel(data);
+      if (!panel) return;
+      if (data.kind === "started") {
+        applyManifest(panel, data);
+      } else if (data.kind === "step_saved") {
+        addArtifact(panel, data.artifact);
+        updateSummary(panel);
+      } else if (data.kind === "finalizing") {
+        setZip(panel, false, "Preparing ZIP…");
+      } else if (data.kind === "finished") {
+        applyManifest(panel, data);
+      } else if (data.kind === "archive_error") {
+        updateSummary(panel, data);
+      }
     });
-
-    // reset the panels back to idle when a new run starts
-    api.addEventListener("execution_start", () => {
-      for (const n of app.graph?._nodes || []) {
-        const p = n._mmxPreview;
-        if (!p) continue;
-        p.left.textContent = "waiting…";
-        p.right.textContent = "";
+    api.addEventListener("minimax_h3_preview", ({ detail: data }) => {
+      if (!data) return;
+      const panel = eventPanel(data);
+      if (!panel) return;
+      panel.latestDisplay = data;
+      if (panel.selected == null) showPreview(panel, data);
+    });
+    api.addEventListener("execution_start", ({ detail }) => {
+      for (const node of app.graph?._nodes || []) {
+        if (node._mmxPreview) resetPanel(node._mmxPreview, detail?.prompt_id);
+      }
+    });
+    const terminal = ({ detail }) => {
+      for (const node of app.graph?._nodes || []) {
+        const panel = node._mmxPreview;
+        if (!panel || (detail?.prompt_id && panel.promptId !== detail.prompt_id)) continue;
+        if (panel.runId) {
+          if (!panel.terminal) void reconcile(panel);
+        } else {
+          panel.left.textContent = "idle";
+          panel.summary.textContent = "No new previews generated";
+        }
+      }
+    };
+    for (const type of ["execution_success", "execution_interrupted", "execution_error"]) {
+      api.addEventListener(type, terminal);
+    }
+    api.addEventListener("reconnected", () => {
+      for (const node of app.graph?._nodes || []) {
+        const panel = node._mmxPreview;
+        if (panel?.runId && !panel.terminal) {
+          panel.retries = 0;
+          void reconcile(panel);
+        }
       }
     });
   },

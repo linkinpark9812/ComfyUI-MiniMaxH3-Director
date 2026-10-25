@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**Downloadable sampling history.** Preview Override now saves animated WebPs at the
+configured `every_n_steps` interval (default every step), lists them beside the live
+preview, and creates a ZIP after sampling completes or is canceled. `archive_folder_name`
+controls the ZIP's inner folder and server grouping; separate run directories preserve
+previous captures. Files keep actual step numbers, including gaps, and the final callback
+is captured even when off cadence. Individual downloads are available during sampling.
+
+Capture is independent of animation playback and the overhead setting: those now space
+live display updates only. VAE users should increase the capture interval to limit total
+preview work. Archive errors leave video generation running and report what was saved.
+
 ## 0.3.2
 
 **A voice on the subject, not on the timeline** (issue #10). Every subject slot has an

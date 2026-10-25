@@ -20,6 +20,7 @@ import os
 import platform
 import subprocess
 import wave
+from urllib.parse import quote
 
 import av
 import numpy as np
@@ -31,10 +32,57 @@ import folder_paths
 from aiohttp import web
 from server import PromptServer
 
+from .minimax_preview_archive import read_manifest, artifact_path
+
 log = logging.getLogger(__name__)
 
 WORKSPACE_SUBDIR = "whatdreamscost"
 AUDIO_SR = 44100
+
+
+# These read-only routes share the same server access policy as ComfyUI's /view.
+# File resolution is manifest-based and confined to the preview output directory.
+async def _preview_archive_response(request, kind):
+    folder = request.query.get("folder", "")
+    run_id = request.query.get("run_id", "")
+    output_root = folder_paths.get_output_directory()
+    try:
+        manifest = await asyncio.to_thread(read_manifest, output_root, folder, run_id)
+        if kind == "manifest":
+            return web.json_response(manifest, headers={"Cache-Control": "no-store"})
+        step = int(request.query.get("step", "")) if kind == "step" else None
+        path = await asyncio.to_thread(artifact_path, output_root, folder, run_id, manifest, step)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise web.HTTPNotFound(text="Preview artifact not found") from exc
+    except RuntimeError as exc:
+        raise web.HTTPConflict(text=str(exc)) from exc
+    except OSError as exc:
+        log.warning("[MiniMaxDirector] cannot read preview archive: %s", exc)
+        raise web.HTTPServiceUnavailable(text="Preview archive cannot be read") from exc
+    download = kind == "zip" or request.query.get("download") == "1"
+    disposition = "attachment" if download else "inline"
+    return web.FileResponse(path, headers={
+        "Content-Type": "application/zip" if kind == "zip" else "image/webp",
+        "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(path.name, safe='')}",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
+@PromptServer.instance.routes.get("/minimax_director/preview_archive/manifest")
+async def preview_archive_manifest(request):
+    return await _preview_archive_response(request, "manifest")
+
+
+@PromptServer.instance.routes.get("/minimax_director/preview_archive/step")
+async def preview_archive_step(request):
+    return await _preview_archive_response(request, "step")
+
+
+@PromptServer.instance.routes.get("/minimax_director/preview_archive/zip")
+async def preview_archive_zip(request):
+    return await _preview_archive_response(request, "zip")
 
 
 # --------------------------------------------------------------------------------------

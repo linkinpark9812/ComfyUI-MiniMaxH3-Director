@@ -30,15 +30,21 @@ import torch.nn.functional as F
 from PIL import Image
 
 import comfy.patcher_extension
+from comfy.model_management import InterruptProcessingException
+from comfy_execution.utils import get_executing_context
+import folder_paths
 import comfy.utils
 import latent_preview
 import server
 from comfy_api.latest import io
 from protocol import BinaryEventTypes
 
+from .minimax_preview_archive import DEFAULT_FOLDER, PreviewArchiveSession, normalize_folder, new_run_id
+
 log = logging.getLogger(__name__)
 
 EVENT = "minimax_h3_preview"
+ARCHIVE_EVENT = "minimax_h3_preview_archive"
 DECODE_FAST = "latent2rgb (fast)"
 DECODE_VAE = "vae (quality)"
 PLAYBACK_TRUE = "true speed"
@@ -147,20 +153,16 @@ def _encode_animated_webp(frames, fps, quality):
         frames[0].save(buf, format="WEBP", save_all=True, append_images=frames[1:],
                        duration=max(1, int(round(1000 / max(1, fps)))), loop=0,
                        quality=quality, method=0)
+    except InterruptProcessingException:
+        raise
     except Exception as e:
         log.warning("[MiniMaxDirector] animated WebP encode failed: %s", e)
         return None
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
 
 
 def throttle_gap(cost_seconds, max_overhead_percent):
-    """How long to wait after a preview that took `cost_seconds`.
-
-    A full VAE decode of a 1344x768 shot can cost tens of seconds — once per step that is
-    minutes of pure overhead. Rather than guess a step interval, hold previews to a share
-    of wall-clock: to spend at most P percent of the time previewing, a render costing C
-    must be followed by C*(100/P - 1) seconds of actual sampling.
-    """
+    """Space live display updates by cost; archive capture cadence is independent."""
     if max_overhead_percent <= 0 or cost_seconds <= 0:
         return 0.0
     return cost_seconds * (100.0 / float(max_overhead_percent) - 1.0)
@@ -169,7 +171,9 @@ def throttle_gap(cost_seconds, max_overhead_percent):
 class _VHSStreamer:
     """Streams individual frames to VideoHelperSuite's animated latent-preview player."""
 
-    def __init__(self, rate):
+    def __init__(self, rate, client_id, node_id):
+        self.client_id = client_id
+        self.node_id = str(node_id or "")
         self.rate = max(1, int(rate))
         self.first = True
         self.last_time = 0.0
@@ -177,6 +181,8 @@ class _VHSStreamer:
 
     def send(self, pil_frames, rate=None):
         srv = server.PromptServer.instance
+        if self.client_id is None:
+            return 0
         total = len(pil_frames)
         if total == 0:
             return 0
@@ -193,18 +199,18 @@ class _VHSStreamer:
         if self.first:
             self.first = False
             srv.send_sync("VHS_latentpreview",
-                          {"length": total, "rate": self.rate, "id": srv.last_node_id})
+                          {"length": total, "rate": self.rate, "id": self.node_id}, self.client_id)
             self.last_time = now + 1.0 / self.rate
 
         order = [(self.cursor + i) % total for i in range(count)]
-        node_id = (srv.last_node_id or "").encode("ascii")
+        node_id = self.node_id.encode("ascii", errors="replace")
         for i in order:
             message = _io.BytesIO()
             message.write((1).to_bytes(length=4, byteorder="big") * 2)
             message.write(i.to_bytes(length=4, byteorder="big"))
             message.write(struct.pack("16p", node_id))
             pil_frames[i].save(message, format="JPEG", quality=95)
-            srv.send_sync(BinaryEventTypes.PREVIEW_IMAGE, message.getvalue(), srv.client_id)
+            srv.send_sync(BinaryEventTypes.PREVIEW_IMAGE, message.getvalue(), self.client_id)
         self.cursor = (self.cursor + count) % total
         return count
 
@@ -212,7 +218,7 @@ class _VHSStreamer:
 class _OuterSampleWrapper:
     def __init__(self, node_id, decode_mode, vae, max_resolution, preview_frames,
                  preview_fps, webp_quality, every_n_steps, suppress_default, target,
-                 max_overhead=25, playback=None):
+                 max_overhead=25, playback=None, archive_folder_name=DEFAULT_FOLDER):
         self.node_id = node_id
         self.decode_mode = decode_mode
         self.vae = vae
@@ -225,6 +231,7 @@ class _OuterSampleWrapper:
         self.target = target
         self.max_overhead = max(0, min(100, int(max_overhead)))
         self.playback = playback or PLAYBACK_TRUE
+        self.archive_folder_name = archive_folder_name
 
     def _rate_for(self, shown, pixel_frames):
         """Frames per second to play `shown` images at.
@@ -245,122 +252,169 @@ class _OuterSampleWrapper:
             return max(0.1, self.preview_fps)
         return max(0.1, self.preview_fps * shown / max(1, pixel_frames))
 
-    def _send_to_node(self, b64, n_frames, step, total_steps, ms, rate):
-        server.PromptServer.instance.send_sync(EVENT, {
-            "node_id": self.node_id, "webp": b64, "frames": n_frames,
-            "fps": round(float(rate), 2), "source_fps": round(float(self.preview_fps), 2),
-            "step": step, "total_steps": total_steps, "ms": ms, "mode": self.decode_mode,
-            "playback": self.playback,
-        })
-
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask,
                  callback, disable_pbar, seed, **kwargs):
-        guider = executor.class_obj
-        latent_shapes = kwargs.get("latent_shapes")
-        latent_format = guider.model_patcher.model.latent_format
+        # Resolve at sampling time, not execute(): the patched model may be cached.
+        srv = server.PromptServer.instance
+        context = get_executing_context()
+        client_id = getattr(srv, "client_id", None)
+        identity = {
+            "node_id": self.node_id, "run_id": new_run_id(),
+            "folder_name": normalize_folder(self.archive_folder_name),
+            "prompt_id": getattr(context, "prompt_id", None),
+            "sampler_id": getattr(context, "node_id", None),
+        }
+        sequence = 0
 
-        to_rgb = None
-        if self.decode_mode == DECODE_FAST or self.vae is None:
+        def emit(kind, payload=None, event=ARCHIVE_EVENT):
+            nonlocal sequence
+            sequence += 1
+            if client_id is None:
+                return  # None means broadcast in ComfyUI; headless runs must not broadcast.
             try:
-                to_rgb = _RGBFactors(latent_format)
-            except Exception as e:
-                log.warning("[MiniMaxDirector] preview unavailable: %s", e)
+                srv.send_sync(event, {**identity, **(payload or {}), "kind": kind,
+                                      "sequence": sequence}, client_id)
+            except Exception:
+                log.warning("[MiniMaxDirector] preview notification failed", exc_info=True)
 
-        vhs = _VHSStreamer(self.preview_fps) if self.target in (TARGET_SAMPLER, TARGET_BOTH) else None
-        to_node = self.target in (TARGET_NODE, TARGET_BOTH)
+        session = None
+        storage_failed = False
+        try:
+            session = PreviewArchiveSession(
+                folder_paths.get_output_directory(), self.archive_folder_name, self.node_id,
+                {k: identity[k] for k in ("prompt_id", "sampler_id")},
+                {"every_n_steps": self.every_n_steps, "decode": self.decode_mode,
+                 "preview_frames": self.preview_frames, "preview_fps": self.preview_fps,
+                 "max_resolution": self.max_resolution, "webp_quality": self.webp_quality,
+                 "playback": self.playback, "preview_target": self.target})
+            identity["run_id"] = session.manifest["run_id"]
+            emit("started", session.snapshot())
+        except Exception as exc:
+            storage_failed = True
+            log.warning("[MiniMaxDirector] cannot create preview archive: %s", exc)
+            emit("started", {"archive_state": "unavailable", "error": str(exc),
+                             "sampling_status": "running", "artifacts": []})
 
-        # Core's previewer is built before we are reached, so suppression has to happen on
-        # the class it goes through. Restored in the finally below, always.
+        def failure(step, exc, storage=False):
+            nonlocal storage_failed
+            message = str(exc) or type(exc).__name__
+            if session:
+                session.manifest["capture_failures"].append({"step": step, "error": message})
+                if storage:
+                    session.manifest["error"] = "Preview storage failed: " + message
+            if storage:
+                storage_failed = True
+            log.warning("[MiniMaxDirector] preview step %s failed: %s", step, message)
+            emit("archive_error", {"error": message, "step": step})
+
         original_decode = latent_preview.LatentPreviewer.decode_latent_to_preview_image
-        if self.suppress_default:
-            latent_preview.LatentPreviewer.decode_latent_to_preview_image = \
-                lambda self_, preview_format, x0: None
-
-        original_cb = callback
-        state = {"warned": False, "sent": 0, "cost": 0.0, "finished": 0.0, "anim": 0.0,
-                 "throttle_logged": False, "cap_logged": False}
-        log.info("[MiniMaxDirector] preview: %s, target=%s, <=%d frames @%d fps, max %dpx.",
-                 self.decode_mode, self.target, self.preview_frames, self.preview_fps,
-                 self.max_resolution)
-
-        def _should_skip(now):
-            gap = throttle_gap(state["cost"], self.max_overhead)
-            if to_node:
-                # Replacing the <img> restarts the animation from frame one. Send a new one
-                # every step and a five-second loop never gets past its first second — it
-                # reads as a stuck, crawling preview. Let each animation play through.
-                gap = max(gap, state["anim"])
-            return gap > 0 and (now - state["finished"]) < gap
-
-        def combined(step, x0, x, total_steps):
-            if (to_rgb is not None or self.vae is not None) and x0 is not None \
-                    and step % self.every_n_steps == 0 and not _should_skip(time.time()):
-                t0 = time.time()
+        status, sampling_error = "failed", None
+        try:
+            to_node = self.target in (TARGET_NODE, TARGET_BOTH)
+            vhs = (_VHSStreamer(self.preview_fps, client_id, identity["sampler_id"])
+                   if self.target in (TARGET_SAMPLER, TARGET_BOTH) else None)
+            to_rgb = None
+            if self.decode_mode == DECODE_FAST or self.vae is None:
                 try:
-                    video = _video_stream(x0, latent_shapes)
-                    if video is not None and video.ndim == 5:
+                    to_rgb = _RGBFactors(executor.class_obj.model_patcher.model.latent_format)
+                except InterruptProcessingException:
+                    raise
+                except Exception as exc:
+                    failure(0, exc)
+            if self.suppress_default:
+                latent_preview.LatentPreviewer.decode_latent_to_preview_image = \
+                    lambda self_, preview_format, x0: None
+            presentation = {"finished": 0.0, "gap": 0.0}
+            saved_steps = set()
+
+            def combined(step, x0, x, total_steps):
+                number = int(step) + 1
+                if session:
+                    session.manifest.update(last_step=number, total_steps=int(total_steps))
+                eligible = step % self.every_n_steps == 0 or number == total_steps
+                if eligible and number not in saved_steps:
+                    started = time.monotonic()
+                    try:
+                        video = _video_stream(x0, kwargs.get("latent_shapes"))
+                        if video is None or video.ndim != 5:
+                            raise ValueError("No usable H3 video latent for this step")
                         pixel_frames = pixel_frames_from_latent_t(int(video.shape[2]))
                         video = _pick_frames(video, self.preview_frames)
-                        if self.decode_mode == DECODE_VAE and self.vae is not None:
-                            images = _vae_decode(self.vae, video)
-                        else:
-                            images = to_rgb(video)
+                        images = (_vae_decode(self.vae, video)
+                                  if self.decode_mode == DECODE_VAE and self.vae is not None
+                                  else to_rgb(video))
                         frames = _to_pil(images, self.max_resolution)
-                        # The shot lasts pixel_frames / fps seconds. Spread however many
-                        # frames we ended up with across exactly that long. Counting them
-                        # after the decode matters: latent2rgb yields one image per latent
-                        # frame, the VAE expands each latent frame into ~3.35 of them.
                         rate = self._rate_for(len(frames), pixel_frames)
-                        if not state["cap_logged"] and self.playback == PLAYBACK_TRUE \
-                                and rate < self.preview_fps - 0.05:
-                            state["cap_logged"] = True
-                            log.info("[MiniMaxDirector] preview plays at %.1f fps, not %.0f: "
-                                     "%d frame(s) spread over the shot's %.2fs so it lasts as "
-                                     "long as the finished clip. %s Switch playback to '%s' to "
-                                     "play them at %.0f fps instead — the motion reads normally, "
-                                     "the clip ends early.",
-                                     rate, self.preview_fps, len(frames),
-                                     pixel_frames / MODEL_FPS,
-                                     "latent2rgb has one image per latent frame, so it cannot "
-                                     "exceed %.1f fps here." % (self.preview_fps * 5.0 / 17.0)
-                                     if self.decode_mode != DECODE_VAE else
-                                     "Raising preview_frames raises it.",
-                                     PLAYBACK_SOURCE, self.preview_fps)
-                        if to_node:
-                            b64 = _encode_animated_webp(frames, rate, self.webp_quality)
-                            if b64:
-                                self._send_to_node(b64, len(frames), step + 1, total_steps,
-                                                   int((time.time() - t0) * 1000), rate)
-                        if vhs is not None:
-                            vhs.send(frames, rate)
-                        state["sent"] += len(frames)
-                        state["cost"] = time.time() - t0
-                        state["finished"] = time.time()
-                        state["anim"] = len(frames) / max(0.1, rate) if to_node else 0.0
-                        if self.max_overhead > 0 and state["cost"] > 1.0 \
-                                and not state["throttle_logged"]:
-                            state["throttle_logged"] = True
-                            log.info("[MiniMaxDirector] a preview costs %.1fs; holding it to "
-                                     "%d%% of the render, so previews will be spaced ~%.0fs "
-                                     "apart. Lower preview_frames or max_resolution for more "
-                                     "of them.", state["cost"], self.max_overhead,
-                                     state["cost"] * (100.0 / self.max_overhead - 1.0))
-                except Exception as e:
-                    # never take the generation down over a preview
-                    if not state["warned"]:
-                        state["warned"] = True
-                        log.warning("[MiniMaxDirector] preview failed, continuing without "
-                                    "it: %r", e, exc_info=True)
-            if original_cb is not None:
-                original_cb(step, x0, x, total_steps)
+                        data = _encode_animated_webp(frames, rate, self.webp_quality)
+                        if not data:
+                            raise ValueError("Animated WebP encoding failed")
+                        metadata = {"frames": len(frames), "fps": round(rate, 2),
+                                    "source_fps": self.preview_fps, "step": number,
+                                    "total_steps": int(total_steps), "mode": self.decode_mode,
+                                    "playback": self.playback,
+                                    "ms": int((time.monotonic() - started) * 1000)}
+                        record = None
+                        if session and not storage_failed:
+                            try:
+                                record = session.save_step(number, data, metadata)
+                                saved_steps.add(number)
+                                emit("step_saved", {"artifact": record})
+                            except InterruptProcessingException:
+                                raise
+                            except Exception as exc:
+                                failure(number, exc, storage=True)
+                        elif session:
+                            session.manifest["capture_failures"].append(
+                                {"step": number, "error": "Storage unavailable"})
+                        # Capture always runs at the selected interval. Only live display
+                        # is throttled to avoid restarting an animation every callback.
+                        now = time.monotonic()
+                        if now - presentation["finished"] >= presentation["gap"]:
+                            if to_node:
+                                payload = dict(metadata)
+                                if record:
+                                    payload["artifact"] = record
+                                else:
+                                    payload["webp"] = base64.b64encode(data).decode("ascii")
+                                emit("display", payload, event=EVENT)
+                            if vhs:
+                                vhs.send(frames, rate)
+                            cost = time.monotonic() - started
+                            presentation.update(finished=time.monotonic(), gap=max(
+                                throttle_gap(cost, self.max_overhead),
+                                len(frames) / max(0.1, rate) if to_node else 0.0))
+                    except InterruptProcessingException:
+                        raise
+                    except Exception as exc:
+                        failure(number, exc)
+                if callback is not None:
+                    callback(step, x0, x, total_steps)
 
-        try:
-            out = executor(noise, latent_image, sampler, sigmas, denoise_mask, combined,
-                           disable_pbar, seed, **kwargs)
+            result = executor(noise, latent_image, sampler, sigmas, denoise_mask, combined,
+                              disable_pbar, seed, **kwargs)
+            status = "completed"
+            return result
+        except InterruptProcessingException:
+            status = "interrupted"
+            raise
+        except BaseException as exc:
+            sampling_error = str(exc) or type(exc).__name__
+            raise
         finally:
+            # Restore first; archive I/O must never delay restoring ComfyUI's previewer.
             latent_preview.LatentPreviewer.decode_latent_to_preview_image = original_decode
-        log.info("[MiniMaxDirector] preview rendered %d frames.", state["sent"])
-        return out
+            if session:
+                emit("finalizing", {"sampling_status": status, "archive_state": "finalizing"})
+                try:
+                    summary = session.finalize(status, sampling_error)
+                except Exception as exc:
+                    log.warning("[MiniMaxDirector] archive finalization failed", exc_info=True)
+                    summary = session.snapshot()
+                    summary.update(sampling_status=status, archive_state="unavailable", error=str(exc))
+                emit("finished", summary)
+            else:
+                emit("finished", {"sampling_status": status, "archive_state": "unavailable",
+                                  "error": "Preview archive storage was unavailable"})
 
 
 class MiniMaxH3PreviewOverride(io.ComfyNode):
@@ -405,12 +459,12 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
                 io.Int.Input("webp_quality", default=80, min=1, max=100, step=1, optional=True,
                              tooltip="WebP quality of the animation sent to the node."),
                 io.Int.Input("every_n_steps", default=1, min=1, max=50, step=1, optional=True,
-                             tooltip="Never preview more often than every N sampler steps."),
+                             tooltip="Save step 1, then every N steps, plus the final step. "
+                                     "Filenames retain the actual step numbers. Default: every step."),
                 io.Int.Input("max_preview_overhead", default=25, min=0, max=100, step=5, optional=True,
-                             tooltip="Cap on how much of the render time previews may use, in "
-                                     "percent. A full VAE decode can cost tens of seconds per "
-                                     "preview; this spaces them out automatically instead of "
-                                     "stalling the run. 0 disables the cap."),
+                             tooltip="Spaces live display updates using preview cost (0 disables). "
+                                     "Does not skip archive captures or cap total decoding time. "
+                                     "Raise every_n_steps to reduce capture overhead."),
                 io.Boolean.Input("suppress_default_preview", default=True, optional=True,
                                  tooltip="Hide ComfyUI's built-in single-frame preview while this runs."),
                 # NEW WIDGETS GO LAST. ComfyUI serialises widget values positionally, so
@@ -428,6 +482,9 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
                                        "ComfyUI's own preview: motion reads at normal speed, "
                                        "the clip ends early. Judge timing with the first, "
                                        "movement with the second."),
+                io.String.Input("archive_folder_name", default=DEFAULT_FOLDER, optional=True,
+                                tooltip="Folder name inside the ZIP and under ComfyUI output. "
+                                        "Each run is stored separately. Not a server path."),
             ],
             outputs=[io.Model.Output(tooltip="Model with the preview attached.")],
             hidden=[io.Hidden.unique_id],
@@ -437,7 +494,7 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
     def execute(cls, model, decode=DECODE_FAST, preview_target=TARGET_NODE, max_resolution=512,
                 preview_frames=24, preview_fps=24.0, playback=PLAYBACK_TRUE, webp_quality=80,
                 every_n_steps=1, max_preview_overhead=25, suppress_default_preview=True,
-                vae=None) -> io.NodeOutput:
+                vae=None, archive_folder_name=DEFAULT_FOLDER) -> io.NodeOutput:
         if decode == DECODE_VAE and vae is None:
             raise ValueError(
                 "MiniMax H3 Preview Override: decode is set to 'vae (quality)' but no VAE is "
@@ -449,7 +506,7 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
         wrapper = _OuterSampleWrapper(
             str(cls.hidden.unique_id), decode, vae, max_resolution, preview_frames,
             preview_fps, webp_quality, every_n_steps, suppress_default_preview,
-            preview_target, max_preview_overhead, playback)
+            preview_target, max_preview_overhead, playback, archive_folder_name)
 
         # Register where the sampler actually looks: CFGGuider reads
         #   get_all_wrappers(OUTER_SAMPLE, self.model_options, is_model_options=True)

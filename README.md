@@ -882,9 +882,50 @@ and renders the whole shot as it denoises.
 | `playback` | `true speed` (default) spreads the sampled frames across the shot's real length, so the preview lasts as long as the finished clip. `source fps` plays them at `preview_fps` flat, like ComfyUI's own preview. |
 | `max_resolution` | Long edge of the preview image, as a **target** — latent2rgb frames arrive at latent size (a 1344×768 shot is an 84×48 grid), so this upscales them smoothly. |
 | `webp_quality` | Quality of the animation sent to the browser. |
-| `every_n_steps` | Never preview more often than every N sampler steps. |
-| `max_preview_overhead` | Share of render time previews may use, in percent (default 25). After a preview costing C seconds the next waits `C·(100/P − 1)` s. 0 disables. |
+| `every_n_steps` | Save step 1, then every N steps, plus the final step. Default 1 saves every step. Filenames keep actual sampler step numbers. |
+| `max_preview_overhead` | Spaces **live display** updates using preview cost (default 25; 0 disables). Does not skip saved steps or cap total capture time. Use `every_n_steps` to reduce capture work. |
 | `suppress_default_preview` | Hides ComfyUI's built-in single-frame preview. |
+| `archive_folder_name` | Name inside the ZIP and under the output directory (default `MiniMaxH3-preview`). Each sampling invocation gets a separate run directory. |
+
+The right-hand list keeps each saved animated WebP. Click a filename to inspect that
+step, its download arrow to save it, or **Live** to return to live playback. History
+updates do not restart the animation on the left. With `sampler (VHS)`, files are still
+saved and listed; live playback remains in the sampler.
+
+**Download all (.zip)** becomes available after sampling finishes or is canceled. The
+ZIP contains one folder named by `archive_folder_name`, with `Step001.webp` and so on
+inside it. Numbers have at least three digits and retain gaps: a 30-step run with
+`every_n_steps=5` saves steps **1, 6, 11, 16, 21, 26, 30**. The final callback is captured
+even when off cadence. Cancellation keeps completed captures; it cannot create an image
+for a callback that did not finish.
+
+Files are saved automatically, even without a browser, under:
+
+```text
+<ComfyUI output>/MiniMaxH3/previews/<folder name>/<unique run ID>/
+  Step001.webp
+  Step006.webp
+  ...
+  <folder name>.zip
+  manifest.json
+```
+
+Folder names are sanitized for Windows/Linux and treated as a single name, not a path.
+A new execution clears the node's image and history, but **never deletes previous server
+files**. Reusing a name creates a separate run directory. A fully cached execution does
+not create new previews. If a patched model feeds multiple samplers, each invocation has
+its own archive; the node shows the newest one. The ZIP is ready when that sampler exits,
+even if downstream video decoding or muxing is still running.
+
+**Capture now follows the requested interval exactly.** Previously the overhead cap and
+animation playback could skip steps even with interval 1. These controls now throttle
+only live presentation. VAE capture at every step can add substantial processing time;
+raise `every_n_steps`, or reduce `preview_frames`/`max_resolution`, to reduce the cost.
+Individual files and their ZIP both occupy disk space; remove old run directories manually
+when no longer needed. Graceful cancellation finalizes the ZIP. A server crash or full
+disk may prevent finalization; already saved WebPs remain, and archive errors are shown
+instead of advertising a complete ZIP. Reloading the browser starts with an empty panel;
+prior runs remain on disk.
 
 The time in the status line (`render 9.9s`) is **server-side**: how long ComfyUI took to
 decode, scale and encode that preview. Not browser time, not the sampler. With
