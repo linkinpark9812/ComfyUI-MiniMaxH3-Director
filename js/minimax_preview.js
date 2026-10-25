@@ -40,15 +40,26 @@ function buildPanel() {
   });
   const img = element("img", { width: "100%", height: "100%", objectFit: "contain", display: "none" });
   img.alt = "Sampling preview";
+  const video = element("video", { width: "100%", height: "100%", objectFit: "contain", display: "none" });
+  video.muted = true;
+  video.autoplay = true;
+  video.loop = true;
+  video.playsInline = true;
+  video.controls = true;
+  video.setAttribute("aria-label", "Synchronized step preview");
   const idle = element("div", { color: "#999", padding: "8px" }, IDLE_TEXT);
-  frame.append(img, idle);
+  frame.append(img, video, idle);
   const sidebar = element("div", {
-    display: "flex", flexDirection: "column", gap: "4px", width: "165px",
+    display: "flex", flexDirection: "column", gap: "4px", width: "230px",
     maxWidth: "45%", minHeight: "0", flexShrink: "0",
   });
   const live = element("button", CONTROL_STYLE, "Live");
   live.type = "button";
   live.title = "Resume the latest live preview";
+  const sound = element("button", CONTROL_STYLE, "Unmute");
+  sound.type = "button";
+  sound.disabled = true;
+  sound.title = "Connect audio_vae to hear saved steps. Playback starts muted.";
   const list = element("div", { overflowY: "auto", flex: "1", minHeight: "0" });
   list.setAttribute("aria-label", "Saved sampling steps");
   const zip = element("a", { ...CONTROL_STYLE, color: "#8bcaff", textAlign: "center",
@@ -63,7 +74,7 @@ function buildPanel() {
       zip.click();
     }
   });
-  sidebar.append(live, list, zip);
+  sidebar.append(live, sound, list, zip);
   body.append(frame, sidebar);
   const status = element("div", { display: "flex", gap: "8px", justifyContent: "space-between",
     fontFamily: "monospace", fontSize: "10px", flexWrap: "wrap" });
@@ -77,7 +88,31 @@ function buildPanel() {
   for (const event of ["pointerdown", "mousedown", "dblclick", "wheel"]) {
     sidebar.addEventListener(event, (e) => e.stopPropagation());
   }
-  const panel = { root, img, idle, left, right, summary, live, list, zip, disposed: false };
+  const panel = { root, img, video, sound, idle, left, right, summary, live, list, zip,
+    muted: true, disposed: false };
+  sound.addEventListener("click", () => {
+    panel.muted = !panel.muted;
+    video.muted = panel.muted;
+    sound.textContent = panel.muted ? "Unmute" : "Mute";
+    sound.setAttribute("aria-pressed", String(!panel.muted));
+    void video.play().catch(() => { sound.title = "Use the player's Play control to start playback"; });
+  });
+  video.addEventListener("volumechange", () => {
+    panel.muted = video.muted;
+    sound.textContent = panel.muted ? "Unmute" : "Mute";
+    sound.setAttribute("aria-pressed", String(!panel.muted));
+  });
+  video.addEventListener("error", () => {
+    if (!video.getAttribute("src")) return;
+    video.style.display = "none";
+    img.style.display = "block";
+    sound.disabled = true;
+    panel.error = "AV playback unavailable; WebP and WAV downloads are still available";
+    updateSummary(panel);
+  });
+  for (const event of ["pointerdown", "mousedown", "dblclick", "wheel"]) {
+    video.addEventListener(event, (e) => e.stopPropagation());
+  }
   live.addEventListener("click", () => {
     panel.selected = null;
     if (panel.latestDisplay) showPreview(panel, panel.latestDisplay);
@@ -110,6 +145,7 @@ function resetPanel(panel, promptId = null) {
   panel.list.replaceChildren();
   panel.img.removeAttribute("src");
   panel.img.style.display = "none";
+  stopAV(panel);
   panel.idle.style.display = "block";
   panel.idle.textContent = IDLE_TEXT;
   panel.left.textContent = promptId ? "waiting…" : "idle";
@@ -119,12 +155,37 @@ function resetPanel(panel, promptId = null) {
   setZip(panel, false);
 }
 
+function stopAV(panel) {
+  panel.video.pause();
+  panel.video.removeAttribute("src");
+  panel.video.load();
+  panel.video.style.display = "none";
+  panel.sound.disabled = true;
+}
+
 function showPreview(panel, data) {
   const artifact = data.artifact || data;
   const src = data.webp ? `data:image/webp;base64,${data.webp}`
     : api.apiURL(archiveURL(panel, "step", artifact.step));
   if (panel.img.getAttribute("src") !== src) panel.img.src = src;
   panel.img.style.display = "block";
+  if (artifact.audio) {
+    const avSrc = api.apiURL(archiveURL(panel, "playback", artifact.step));
+    if (panel.video.getAttribute("src") !== avSrc) {
+      panel.video.pause();
+      panel.video.muted = panel.muted;
+      panel.video.src = avSrc;
+    }
+    panel.img.style.display = "none";
+    panel.video.style.display = "block";
+    panel.sound.disabled = false;
+    panel.sound.title = "Audio and video share one playback clock at the clip's real speed";
+    void panel.video.play().catch(() => {
+      panel.sound.title = "Use the player's Play control to start audio/video playback";
+    });
+  } else {
+    stopAV(panel);
+  }
   panel.idle.style.display = "none";
   const rate = Number(artifact.fps || 0);
   const source = Number(artifact.source_fps || rate);
@@ -132,6 +193,9 @@ function showPreview(panel, data) {
     ? `${rate.toFixed(1)}fps of ${source.toFixed(0)} · true speed`
     : `${rate.toFixed(1)}fps${artifact.playback === "source fps" ? " · source" : ""}`;
   panel.left.textContent = `step ${artifact.step}/${artifact.total_steps} · ${artifact.frames}f @${fps}`;
+  if (artifact.audio) {
+    panel.left.textContent = `step ${artifact.step}/${artifact.total_steps} · AV · ${artifact.audio.duration.toFixed(2)}s · real time`;
+  }
   panel.right.textContent = `render ${((artifact.ms || 0) / 1000).toFixed(2)}s · ${(artifact.mode || "").split(" ")[0]}`;
 }
 
@@ -149,12 +213,25 @@ function addArtifact(panel, artifact) {
     panel.live.setAttribute("aria-pressed", "false");
     showPreview(panel, artifact);
   });
-  const download = element("a", { ...CONTROL_STYLE, color: "#8bcaff", textDecoration: "none" }, "↓");
+  const download = element("a", { ...CONTROL_STYLE, color: "#8bcaff", textDecoration: "none" }, "WebP");
   download.href = api.apiURL(archiveURL(panel, "step", artifact.step, true));
   download.download = artifact.filename;
   download.title = `Download ${artifact.filename}`;
   download.setAttribute("aria-label", download.title);
-  row.append(select, download);
+  const wav = element(artifact.audio ? "a" : "button", {
+    ...CONTROL_STYLE, color: "#8bcaff", textDecoration: "none",
+  }, "WAV");
+  if (artifact.audio) {
+    wav.href = api.apiURL(archiveURL(panel, "audio", artifact.step, true));
+    wav.download = artifact.audio.filename;
+    wav.title = `Download ${artifact.audio.filename}`;
+    wav.setAttribute("aria-label", wav.title);
+  } else {
+    wav.disabled = true;
+    wav.title = artifact.audio_error || "No audio saved for this step; connect audio_vae before running";
+    wav.style.opacity = "0.4";
+  }
+  row.append(select, download, wav);
   const following = [...panel.list.children].find((r) => Number(r.dataset.step) > artifact.step);
   panel.list.insertBefore(row, following || null);
 }

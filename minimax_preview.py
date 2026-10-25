@@ -40,6 +40,7 @@ from comfy_api.latest import io
 from protocol import BinaryEventTypes
 
 from .minimax_preview_archive import DEFAULT_FOLDER, PreviewArchiveSession, normalize_folder, new_run_id
+from .minimax_core import audio_nodes
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +67,31 @@ def _video_stream(x0, latent_shapes=None):
     if latent_shapes and len(latent_shapes) > 1:
         return comfy.utils.unpack_latents(x0, list(latent_shapes))[0]
     return None
+
+
+def _audio_stream(x0, latent_shapes=None):
+    """Read H3's [B, 32, stereo, T] audio stream without modifying the sampler pack."""
+    if x0 is None:
+        return None
+    if getattr(x0, "is_nested", False):
+        streams = x0.tensors
+    elif latent_shapes and len(latent_shapes) > 1:
+        streams = comfy.utils.unpack_latents(x0, list(latent_shapes))
+    else:
+        return None
+    return streams[1] if len(streams) > 1 else None
+
+
+def _decode_audio_wav(vae, latent, duration):
+    from .minimax_preview_audio import encode_wav
+
+    if latent is None or latent.ndim != 4:
+        raise ValueError("No H3 audio latent is available for this step")
+    # Use ComfyUI's own audio decoding/normalization and never lend it sampler storage.
+    decoded = audio_nodes().VAEDecodeAudio.execute(
+        vae=vae, samples={"samples": latent[:1].detach().clone()}).args[0]
+    samples = decoded["waveform"][0].detach().float().cpu().numpy()
+    return encode_wav(samples, decoded["sample_rate"], duration)
 
 
 def _pick_frames(video, max_frames):
@@ -218,7 +244,8 @@ class _VHSStreamer:
 class _OuterSampleWrapper:
     def __init__(self, node_id, decode_mode, vae, max_resolution, preview_frames,
                  preview_fps, webp_quality, every_n_steps, suppress_default, target,
-                 max_overhead=25, playback=None, archive_folder_name=DEFAULT_FOLDER):
+                 max_overhead=25, playback=None, archive_folder_name=DEFAULT_FOLDER,
+                 audio_vae=None):
         self.node_id = node_id
         self.decode_mode = decode_mode
         self.vae = vae
@@ -232,6 +259,7 @@ class _OuterSampleWrapper:
         self.max_overhead = max(0, min(100, int(max_overhead)))
         self.playback = playback or PLAYBACK_TRUE
         self.archive_folder_name = archive_folder_name
+        self.audio_vae = audio_vae
 
     def _rate_for(self, shown, pixel_frames):
         """Frames per second to play `shown` images at.
@@ -286,7 +314,8 @@ class _OuterSampleWrapper:
                 {"every_n_steps": self.every_n_steps, "decode": self.decode_mode,
                  "preview_frames": self.preview_frames, "preview_fps": self.preview_fps,
                  "max_resolution": self.max_resolution, "webp_quality": self.webp_quality,
-                 "playback": self.playback, "preview_target": self.target})
+                 "playback": self.playback, "preview_target": self.target,
+                 "capture_audio": self.audio_vae is not None})
             identity["run_id"] = session.manifest["run_id"]
             emit("started", session.snapshot())
         except Exception as exc:
@@ -338,6 +367,8 @@ class _OuterSampleWrapper:
                         video = _video_stream(x0, kwargs.get("latent_shapes"))
                         if video is None or video.ndim != 5:
                             raise ValueError("No usable H3 video latent for this step")
+                        if self.audio_vae is not None:
+                            video = video[:1]  # One paired clip, not several batches concatenated.
                         pixel_frames = pixel_frames_from_latent_t(int(video.shape[2]))
                         video = _pick_frames(video, self.preview_frames)
                         images = (_vae_decode(self.vae, video)
@@ -353,10 +384,23 @@ class _OuterSampleWrapper:
                                     "total_steps": int(total_steps), "mode": self.decode_mode,
                                     "playback": self.playback,
                                     "ms": int((time.monotonic() - started) * 1000)}
+                        audio_data, audio_metadata = None, None
+                        if self.audio_vae is not None:
+                            try:
+                                audio_data, audio_metadata = _decode_audio_wav(
+                                    self.audio_vae, _audio_stream(x0, kwargs.get("latent_shapes")),
+                                    pixel_frames / MODEL_FPS)
+                            except InterruptProcessingException:
+                                raise
+                            except Exception as exc:
+                                metadata["audio_error"] = str(exc) or type(exc).__name__
+                                failure(number, RuntimeError("Audio preview: " + metadata["audio_error"]))
+                        metadata["ms"] = int((time.monotonic() - started) * 1000)
                         record = None
                         if session and not storage_failed:
                             try:
-                                record = session.save_step(number, data, metadata)
+                                record = session.save_step(number, data, metadata,
+                                                           audio_data, audio_metadata)
                                 saved_steps.add(number)
                                 emit("step_saved", {"artifact": record})
                             except InterruptProcessingException:
@@ -382,7 +426,8 @@ class _OuterSampleWrapper:
                             cost = time.monotonic() - started
                             presentation.update(finished=time.monotonic(), gap=max(
                                 throttle_gap(cost, self.max_overhead),
-                                len(frames) / max(0.1, rate) if to_node else 0.0))
+                                (audio_metadata["duration"] if audio_metadata else
+                                 len(frames) / max(0.1, rate)) if to_node else 0.0))
                     except InterruptProcessingException:
                         raise
                     except Exception as exc:
@@ -485,6 +530,10 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
                 io.String.Input("archive_folder_name", default=DEFAULT_FOLDER, optional=True,
                                 tooltip="Folder name inside the ZIP and under ComfyUI output. "
                                         "Each run is stored separately. Not a server path."),
+                io.Vae.Input("audio_vae", optional=True,
+                             tooltip="Connect the MiniMax H3 audio VAE to save a WAV for every "
+                                     "captured step and enable synchronized, real-time AV playback. "
+                                     "Adds audio decoding work. Leave disconnected for WebP only."),
             ],
             outputs=[io.Model.Output(tooltip="Model with the preview attached.")],
             hidden=[io.Hidden.unique_id],
@@ -494,7 +543,7 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
     def execute(cls, model, decode=DECODE_FAST, preview_target=TARGET_NODE, max_resolution=512,
                 preview_frames=24, preview_fps=24.0, playback=PLAYBACK_TRUE, webp_quality=80,
                 every_n_steps=1, max_preview_overhead=25, suppress_default_preview=True,
-                vae=None, archive_folder_name=DEFAULT_FOLDER) -> io.NodeOutput:
+                vae=None, archive_folder_name=DEFAULT_FOLDER, audio_vae=None) -> io.NodeOutput:
         if decode == DECODE_VAE and vae is None:
             raise ValueError(
                 "MiniMax H3 Preview Override: decode is set to 'vae (quality)' but no VAE is "
@@ -506,7 +555,7 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
         wrapper = _OuterSampleWrapper(
             str(cls.hidden.unique_id), decode, vae, max_resolution, preview_frames,
             preview_fps, webp_quality, every_n_steps, suppress_default_preview,
-            preview_target, max_preview_overhead, playback, archive_folder_name)
+            preview_target, max_preview_overhead, playback, archive_folder_name, audio_vae)
 
         # Register where the sampler actually looks: CFGGuider reads
         #   get_all_wrappers(OUTER_SAMPLE, self.model_options, is_model_options=True)

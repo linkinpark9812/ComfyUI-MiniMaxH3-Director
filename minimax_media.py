@@ -32,12 +32,13 @@ import folder_paths
 from aiohttp import web
 from server import PromptServer
 
-from .minimax_preview_archive import read_manifest, artifact_path
+from .minimax_preview_archive import read_manifest, artifact_path, contained
 
 log = logging.getLogger(__name__)
 
 WORKSPACE_SUBDIR = "whatdreamscost"
 AUDIO_SR = 44100
+_preview_mux_lock = asyncio.Lock()
 
 
 # These read-only routes share the same server access policy as ComfyUI's /view.
@@ -50,8 +51,21 @@ async def _preview_archive_response(request, kind):
         manifest = await asyncio.to_thread(read_manifest, output_root, folder, run_id)
         if kind == "manifest":
             return web.json_response(manifest, headers={"Cache-Control": "no-store"})
-        step = int(request.query.get("step", "")) if kind == "step" else None
-        path = await asyncio.to_thread(artifact_path, output_root, folder, run_id, manifest, step)
+        step = int(request.query.get("step", "")) if kind in ("step", "audio", "playback") else None
+        extension = "wav" if kind == "audio" else "webp"
+        path = await asyncio.to_thread(artifact_path, output_root, folder, run_id, manifest, step, extension)
+        if kind == "playback":
+            from pathlib import Path
+            from .minimax_preview_audio import build_av_preview
+
+            wav = await asyncio.to_thread(artifact_path, output_root, folder, run_id, manifest, step, "wav")
+            cache_root = Path(folder_paths.get_temp_directory()).resolve()
+            cache = contained(cache_root, cache_root / "MiniMaxH3-preview-av" / run_id / f"Step{step:03d}.mp4")
+            # Serialize expensive CPU conversions; duplicate concurrent requests share the result.
+            async with _preview_mux_lock:
+                if not cache.is_file():
+                    await asyncio.to_thread(build_av_preview, path, wav, cache)
+            path = cache
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -61,10 +75,14 @@ async def _preview_archive_response(request, kind):
     except OSError as exc:
         log.warning("[MiniMaxDirector] cannot read preview archive: %s", exc)
         raise web.HTTPServiceUnavailable(text="Preview archive cannot be read") from exc
+    except Exception as exc:
+        log.exception("[MiniMaxDirector] synchronized preview could not be built")
+        raise web.HTTPServiceUnavailable(text="Synchronized preview unavailable; original downloads remain available") from exc
     download = kind == "zip" or request.query.get("download") == "1"
     disposition = "attachment" if download else "inline"
     return web.FileResponse(path, headers={
-        "Content-Type": "application/zip" if kind == "zip" else "image/webp",
+        "Content-Type": {"zip": "application/zip", "step": "image/webp",
+                         "audio": "audio/wav", "playback": "video/mp4"}[kind],
         "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(path.name, safe='')}",
         "X-Content-Type-Options": "nosniff",
     })
@@ -78,6 +96,16 @@ async def preview_archive_manifest(request):
 @PromptServer.instance.routes.get("/minimax_director/preview_archive/step")
 async def preview_archive_step(request):
     return await _preview_archive_response(request, "step")
+
+
+@PromptServer.instance.routes.get("/minimax_director/preview_archive/audio")
+async def preview_archive_audio(request):
+    return await _preview_archive_response(request, "audio")
+
+
+@PromptServer.instance.routes.get("/minimax_director/preview_archive/playback")
+async def preview_archive_playback(request):
+    return await _preview_archive_response(request, "playback")
 
 
 @PromptServer.instance.routes.get("/minimax_director/preview_archive/zip")

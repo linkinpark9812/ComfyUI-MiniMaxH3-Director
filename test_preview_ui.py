@@ -18,7 +18,7 @@ from PIL import Image
 from playwright.async_api import async_playwright
 
 import minimax_preview_archive as archive
-from test_preview_archive import HERE, load_preview_modules
+from test_preview_archive import HERE, load_preview_modules, preview_audio
 
 HOST = """<!doctype html><html><head><meta charset="utf-8"></head>
 <body style="background:#222;font-family:Arial;color:#ddd">
@@ -51,6 +51,7 @@ class PreviewBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         modules, srv, _ = load_preview_modules()
         modules[1].folder_paths.get_output_directory = lambda: self.temp.name
+        modules[1].folder_paths.get_temp_directory = lambda: str(Path(self.temp.name) / "cache")
         app = web.Application()
         app.add_routes(srv.routes)
 
@@ -197,6 +198,67 @@ class PreviewBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.page.evaluate("node.onRemoved()")
         await self.emit("finished", self.session.finalize("completed"))
         self.assertTrue(await self.page.evaluate("node._mmxPreview === null"))
+        self.assertEqual(self.errors, [])
+
+    @unittest.skipUnless(preview_audio, "PyAV and NumPy needed for AV playback")
+    async def test_paired_audio_playback_mute_download_and_reset(self):
+        await self.start()
+        samples = preview_audio.np.zeros((2, 64000), dtype="float32")
+        wav, meta = preview_audio.encode_wav(samples, 32000, 2)
+        record = self.session.save_step(6, self.webp, {"frames": 2, "fps": 5,
+            "total_steps": 30, "source_fps": 24}, wav, meta)
+        await self.emit("step_saved", {"artifact": record})
+        await self.emit("display", {"artifact": record}, event="minimax_h3_preview")
+        await self.page.wait_for_function("node._mmxPreview.video.readyState >= 2")
+        self.assertTrue(await self.page.evaluate("node._mmxPreview.video.muted"))
+        duration = await self.page.evaluate("node._mmxPreview.video.duration")
+        self.assertAlmostEqual(duration, 2, delta=.06)
+        await self.page.get_by_role("button", name="Unmute", exact=True).click()
+        self.assertFalse(await self.page.evaluate("node._mmxPreview.video.muted"))
+        await self.page.get_by_role("button", name="Mute", exact=True).click()
+        self.assertTrue(await self.page.evaluate("node._mmxPreview.video.muted"))
+        async with self.page.expect_download() as download:
+            await self.page.get_by_role("link", name="Download Step006.wav", exact=True).click()
+        file = await download.value
+        self.assertEqual(file.suggested_filename, "Step006.wav")
+        self.assertEqual(Path(await file.path()).read_bytes(), wav)
+        await self.emit("finished", self.session.finalize("interrupted"))
+        async with self.page.expect_download() as download:
+            await self.page.get_by_role("button", name="Download all (.zip)", exact=True).click()
+        file = await download.value
+        with ZipFile(await file.path()) as bundle:
+            self.assertEqual(bundle.namelist(), ["My Shot 東京/Step006.webp", "My Shot 東京/Step006.wav"])
+        screenshot = os.environ.get("MMX_TEST_SCREENSHOT")
+        if screenshot:
+            await self.page.screenshot(path=str(Path(screenshot).with_stem("preview-audio")))
+        await self.page.evaluate("emit('execution_start', {prompt_id: 'next'})")
+        self.assertTrue(await self.page.evaluate("node._mmxPreview.video.paused"))
+        self.assertIsNone(await self.page.locator("#node video").get_attribute("src"))
+        self.assertEqual(self.errors, [])
+
+    @unittest.skipUnless(preview_audio, "PyAV and NumPy needed for AV playback")
+    async def test_audio_step_switch_and_playback_failure_fallback(self):
+        await self.start()
+        wav, meta = preview_audio.encode_wav(preview_audio.np.zeros((2, 32000)), 32000, 1)
+        for step in (1, 6):
+            record = self.session.save_step(step, self.webp, {"frames": 2, "fps": 5,
+                "total_steps": 30}, wav, meta)
+            await self.emit("step_saved", {"artifact": record})
+        await self.page.get_by_role("button", name="Step001.webp", exact=True).click()
+        await self.page.wait_for_function("node._mmxPreview.video.readyState >= 2")
+        await self.page.get_by_role("button", name="Unmute", exact=True).click()
+        await self.page.get_by_role("button", name="Step006.webp", exact=True).click()
+        await self.page.wait_for_function("node._mmxPreview.video.readyState >= 2")
+        self.assertIn("step=6", await self.page.locator("#node video").get_attribute("src"))
+        self.assertFalse(await self.page.evaluate("node._mmxPreview.video.muted"))
+        # A failed playback copy still leaves both original downloads usable.
+        await self.page.route("**/preview_archive/playback?**step=1", lambda route: route.abort())
+        await self.page.get_by_role("button", name="Step001.webp", exact=True).click()
+        await self.page.wait_for_function("node._mmxPreview.sound.disabled")
+        self.assertTrue(await self.page.locator("#node img").is_visible())
+        self.assertFalse(await self.page.locator("#node video").is_visible())
+        self.assertIn("AV playback unavailable", await self.page.locator("[aria-live]").inner_text())
+        self.assertEqual(await self.page.get_by_role("link", name="Download Step001.wav", exact=True).count(), 1)
         self.assertEqual(self.errors, [])
 
 

@@ -2,7 +2,7 @@
 
 Run: python test_preview_archive.py
 Storage tests use only the standard library. Pillow enables animated WebP and stubbed
-sampler tests; aiohttp additionally enables real HTTP download tests. GPU decoding is
+sampler tests; aiohttp enables HTTP downloads and PyAV/NumPy enable real AV codec tests. GPU decoding is
 deliberately stubbed, not represented as real model validation.
 """
 
@@ -19,6 +19,10 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 import minimax_preview_archive as archive
+try:
+    import minimax_preview_audio as preview_audio
+except ImportError:
+    preview_audio = None
 
 try:
     from PIL import Image
@@ -117,6 +121,22 @@ class ArchiveTests(unittest.TestCase):
         with ZipFile(self.session.directory / "MyShot.zip") as bundle:
             self.assertEqual(bundle.read("MyShot/Step001.webp"), b"saved")
 
+    def test_wav_write_failure_preserves_webp_for_finalization(self):
+        original = archive._atomic_write
+
+        def write(path, data):
+            if path.suffix == ".wav":
+                raise OSError("disk full")
+            return original(path, data)
+
+        with patch.object(archive, "_atomic_write", side_effect=write):
+            with self.assertRaises(OSError):
+                self.session.save_step(6, b"saved", {}, b"audio", {})
+        self.session.finalize("interrupted")
+        with ZipFile(self.session.directory / "MyShot.zip") as bundle:
+            self.assertEqual(bundle.namelist(), ["MyShot/Step006.webp"])
+            self.assertEqual(bundle.read("MyShot/Step006.webp"), b"saved")
+
     def test_zip_failure_keeps_individual_files(self):
         self.session.save_step(1, b"saved", {})
         with patch.object(archive.ZipFile, "write", side_effect=OSError("zip failed")):
@@ -154,6 +174,8 @@ def load_preview_modules():
     package_name = "preview_tests_package"
     module(package_name, __path__=[str(HERE)])
     modules[package_name + ".minimax_preview_archive"] = archive
+    if preview_audio:
+        modules[package_name + ".minimax_preview_audio"] = preview_audio
     module("torch", Tensor=object)
     module("torch.nn")
     module("torch.nn.functional")
@@ -170,7 +192,7 @@ def load_preview_modules():
     module("comfy_execution")
     module("comfy_execution.utils", get_executing_context=lambda: types.SimpleNamespace(
         prompt_id="prompt-a", node_id="sampler-a"))
-    module("folder_paths", get_output_directory=lambda: "unused")
+    module("folder_paths", get_output_directory=lambda: "unused", get_temp_directory=lambda: "unused")
 
     class LatentPreviewer:
         def decode_latent_to_preview_image(self, *args):
@@ -201,6 +223,10 @@ def load_preview_modules():
             sys.modules[spec.name] = obj
             spec.loader.exec_module(obj)
             loaded.append(obj)
+    # Lazy codec imports happen during callbacks/HTTP requests, after host stubs exit.
+    sys.modules[package_name] = modules[package_name]
+    if preview_audio:
+        sys.modules[package_name + ".minimax_preview_audio"] = preview_audio
     return loaded, srv, events
 
 
@@ -230,7 +256,10 @@ class SamplerTests(unittest.TestCase):
     def sample(self, interval=1, stop=None, error=None, target="node", wrapper=None):
         preview = self.preview
         self.callbacks = []
-        video = types.SimpleNamespace(ndim=5, shape=(1, 4, 2, 8, 12))
+        class Video(types.SimpleNamespace):
+            def __getitem__(self, key):
+                return self
+        video = Video(ndim=5, shape=(1, 4, 2, 8, 12))
 
         class Executor:
             class_obj = types.SimpleNamespace(model_patcher=types.SimpleNamespace(
@@ -370,10 +399,51 @@ class SamplerTests(unittest.TestCase):
         import inspect
         node = self.preview.MiniMaxH3PreviewOverride
         schema = node.define_schema()
-        self.assertEqual(schema.inputs[-1].id, "archive_folder_name")
-        self.assertEqual(schema.inputs[-2].id, "playback")
+        self.assertEqual(schema.inputs[-1].id, "audio_vae")
+        self.assertEqual(schema.inputs[-2].id, "archive_folder_name")
+        self.assertEqual(schema.inputs[-3].id, "playback")
         self.assertEqual(inspect.signature(node.execute).parameters["archive_folder_name"].default,
                          archive.DEFAULT_FOLDER)
+
+    def test_audio_capture_uses_same_step_and_survives_cancellation(self):
+        wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
+            512, 24, 24, 80, 1, True, "node", archive_folder_name="MyShot", audio_vae=object())
+        with patch.object(self.preview, "_decode_audio_wav", return_value=(b"wav", {"duration": 5 / 24})):
+            with self.assertRaises(self.preview.InterruptProcessingException):
+                self.sample(wrapper=wrapper, stop=3, error=self.preview.InterruptProcessingException())
+        manifest, = self.manifests()
+        self.assertEqual([a["audio"]["filename"] for a in manifest["artifacts"]],
+                         ["Step001.wav", "Step002.wav", "Step003.wav"])
+        with ZipFile(next(Path(self.temp.name).rglob("MyShot.zip"))) as bundle:
+            self.assertEqual(len(bundle.namelist()), 6)
+
+    def test_audio_failure_keeps_video_steps(self):
+        wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
+            512, 24, 24, 80, 5, True, "node", archive_folder_name="MyShot", audio_vae=object())
+        with patch.object(self.preview, "_decode_audio_wav", side_effect=ValueError("bad audio")):
+            with self.assertLogs(self.preview.log, level="WARNING"):
+                self.sample(wrapper=wrapper)
+        manifest, = self.manifests()
+        self.assertEqual(len(manifest["artifacts"]), 7)
+        self.assertEqual(len(manifest["capture_failures"]), 7)
+        self.assertTrue(all(a.get("audio_error") and not a.get("audio") for a in manifest["artifacts"]))
+
+    def test_cancel_during_audio_is_not_swallowed(self):
+        wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
+            512, 24, 24, 80, 1, True, "node", archive_folder_name="MyShot", audio_vae=object())
+        exc = self.preview.InterruptProcessingException()
+        with patch.object(self.preview, "_decode_audio_wav", side_effect=exc):
+            with self.assertRaises(type(exc)) as caught:
+                self.sample(wrapper=wrapper)
+        self.assertIs(caught.exception, exc)
+        self.assertEqual(self.manifests()[0]["sampling_status"], "interrupted")
+
+    def test_audio_stream_unpacking(self):
+        video, audio = object(), object()
+        nested = types.SimpleNamespace(is_nested=True, tensors=(video, audio))
+        self.assertIs(self.preview._audio_stream(nested), audio)
+        with patch.object(self.preview.comfy.utils, "unpack_latents", return_value=(video, audio), create=True):
+            self.assertIs(self.preview._audio_stream(object(), [(1, 24, 2, 8, 8), (1, 32, 2, 8)]), audio)
 
 
 @unittest.skipUnless(web and Image, "aiohttp and Pillow are needed for HTTP tests")
@@ -384,6 +454,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         modules, srv, _ = load_preview_modules()
         self.media = modules[1]
         self.media.folder_paths.get_output_directory = lambda: self.temp.name
+        self.media.folder_paths.get_temp_directory = lambda: str(Path(self.temp.name) / "temp")
         app = web.Application()
         app.add_routes(srv.routes)
         self.client = TestClient(TestServer(app))
@@ -425,6 +496,115 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
                                      ({"run_id": "manifest.json.part", "step": 1}, 400)):
             response = await self.client.get(self.url("step", **parameters))
             self.assertEqual(response.status, expected)
+
+    @unittest.skipUnless(preview_audio, "PyAV and NumPy needed for paired playback tests")
+    async def test_audio_and_synchronized_playback_routes(self):
+        samples = preview_audio.np.zeros((2, 32000), dtype="float32")
+        wav, meta = preview_audio.encode_wav(samples, 32000, 1)
+        webp = io.BytesIO()
+        Image.new("RGB", (16, 16), "red").save(webp, format="WEBP", save_all=True,
+            append_images=[Image.new("RGB", (16, 16), "blue")], duration=100, loop=0)
+        self.session.save_step(2, webp.getvalue(), {}, wav, meta)
+        response = await self.client.get(self.url("audio", step=2, download=1))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "audio/wav")
+        self.assertEqual(await response.read(), wav)
+        response = await self.client.get(self.url("audio", step=1))
+        self.assertEqual(response.status, 404)
+        response = await self.client.get(self.url("playback", step=2))
+        self.assertEqual(response.status, 200, await response.text() if response.status != 200 else "")
+        self.assertEqual(response.content_type, "video/mp4")
+        playback = await response.read()
+        with preview_audio.av.open(io.BytesIO(playback)) as container:
+            self.assertEqual(len(container.streams.audio), 1)
+            self.assertEqual(len(container.streams.video), 1)
+        response = await self.client.get(self.url("playback", step=2), headers={"Range": "bytes=0-31"})
+        self.assertEqual(response.status, 206)
+        self.assertEqual(await response.read(), playback[:32])
+        self.session.finalize("interrupted")
+        response = await self.client.get(self.url("zip"))
+        with ZipFile(io.BytesIO(await response.read())) as bundle:
+            self.assertIn("été 東京/Step002.wav", bundle.namelist())
+            self.assertFalse(any(n.endswith(".mp4") for n in bundle.namelist()))
+
+
+@unittest.skipUnless(preview_audio, "PyAV and NumPy needed for audio tests")
+class AudioTests(unittest.TestCase):
+    def test_wav_channels_timing_and_input_unchanged(self):
+        import wave
+        np = preview_audio.np
+        samples = np.array([[2.0, 0.5, -2.0], [-0.25, 0.0, 0.25]], dtype=np.float32)
+        original = samples.copy()
+        data, metadata = preview_audio.encode_wav(samples, 32000, 0.01)
+        np.testing.assert_array_equal(samples, original)
+        with wave.open(io.BytesIO(data)) as wav:
+            self.assertEqual((wav.getnchannels(), wav.getframerate(), wav.getnframes()), (2, 32000, 320))
+            self.assertEqual(wav.getsampwidth(), 2)
+            pcm = np.frombuffer(wav.readframes(320), dtype="<i2").reshape(-1, 2)
+        self.assertEqual(tuple(pcm[0]), (32767, -8192))
+        self.assertTrue((pcm[3:] == 0).all())
+        self.assertEqual(metadata["duration"], .01)
+        with self.assertRaises(ValueError):
+            preview_audio.encode_wav(np.full((2, 10), np.nan), 32000, 1)
+
+    def test_pair_zip_and_real_time_mux_preserve_merged_frame_timing(self):
+        np = preview_audio.np
+        with tempfile.TemporaryDirectory() as output:
+            session = archive.PreviewArchiveSession(output, "AudioShot", "7")
+            t = np.arange(64000) / 32000
+            samples = np.stack([.2 * np.sin(t * 440 * 2 * np.pi), .1 * np.sin(t * 220 * 2 * np.pi)])
+            wav, metadata = preview_audio.encode_wav(samples, 32000, 2)
+            webp = io.BytesIO()
+            Image.new("RGB", (32, 24), "red").save(webp, format="WEBP", save_all=True,
+                append_images=[Image.new("RGB", (32, 24), "red"), Image.new("RGB", (32, 24), "blue")],
+                duration=[100, 100, 200], loop=0)
+            session.save_step(6, webp.getvalue(), {}, wav, metadata)
+            destination = Path(output) / "temp" / "preview.mp4"
+            preview_audio.build_av_preview(session.directory / "Step006.webp",
+                                            session.directory / "Step006.wav", destination)
+            with preview_audio.av.open(str(destination)) as container:
+                audio, video = container.streams.audio[0], container.streams.video[0]
+                self.assertAlmostEqual(float(audio.duration * audio.time_base), 2, delta=.05)
+                self.assertAlmostEqual(float(video.duration * video.time_base), 2, delta=.05)
+                frames = list(container.decode(video))
+                self.assertAlmostEqual(float(frames[0].pts * frames[0].time_base), 0, delta=.01)
+                self.assertAlmostEqual(float(frames[-1].pts * frames[-1].time_base), 1, delta=.01)
+                self.assertGreater(frames[0].to_image().getpixel((0, 0))[0], 200)
+                self.assertGreater(frames[-1].to_image().getpixel((0, 0))[2], 200)
+            session.finalize("interrupted")
+            with ZipFile(session.directory / "AudioShot.zip") as bundle:
+                self.assertEqual(bundle.namelist(), ["AudioShot/Step006.webp", "AudioShot/Step006.wav"])
+                self.assertEqual(bundle.read("AudioShot/Step006.wav"), wav)
+
+    def test_audio_decoder_receives_a_private_copy(self):
+        np = preview_audio.np
+        modules, _, _ = load_preview_modules()
+        preview = modules[0]
+
+        class Tensor:
+            def __init__(self, data):
+                self.data = np.asarray(data)
+                self.ndim = self.data.ndim
+
+            def __getitem__(self, key): return Tensor(self.data[key])
+            def detach(self): return self
+            def clone(self): return Tensor(self.data.copy())
+            def float(self): return self
+            def cpu(self): return self
+            def numpy(self): return self.data
+
+        latent = Tensor(np.ones((1, 32, 2, 40), dtype=np.float32))
+
+        def decode(vae, samples):
+            samples["samples"].data[:] = 99
+            return types.SimpleNamespace(args=[{"waveform": Tensor(np.zeros((1, 2, 32000))), "sample_rate": 32000}])
+
+        nodes = types.SimpleNamespace(VAEDecodeAudio=types.SimpleNamespace(execute=decode))
+        with patch.object(preview, "audio_nodes", return_value=nodes):
+            data, meta = preview._decode_audio_wav(object(), latent, 1)
+        self.assertTrue((latent.data == 1).all())
+        self.assertEqual(meta["duration"], 1)
+        self.assertTrue(data.startswith(b"RIFF"))
 
 
 if __name__ == "__main__":

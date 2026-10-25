@@ -86,7 +86,7 @@ def read_manifest(output_root, folder, run_id):
     return manifest
 
 
-def artifact_path(output_root, folder, run_id, manifest, step=None):
+def artifact_path(output_root, folder, run_id, manifest, step=None, extension="webp"):
     directory = run_directory(output_root, folder, run_id)
     if step is None:
         if manifest.get("archive_state") != "ready":
@@ -95,9 +95,12 @@ def artifact_path(output_root, folder, run_id, manifest, step=None):
     else:
         if type(step) is not int or step < 1:
             raise ValueError("Invalid step")
-        if not any(record["step"] == step for record in manifest["artifacts"]):
+        if extension not in ("webp", "wav"):
+            raise ValueError("Invalid preview file type")
+        record = next((r for r in manifest["artifacts"] if r["step"] == step), None)
+        if record is None or (extension == "wav" and not record.get("audio")):
             raise FileNotFoundError("Step was not saved")
-        filename = f"Step{step:03d}.webp"
+        filename = f"Step{step:03d}.{extension}"
     path = contained(directory, directory / filename)
     if not path.is_file():
         raise FileNotFoundError(filename)
@@ -120,7 +123,7 @@ class PreviewArchiveSession:
             except FileExistsError:
                 continue
         self.manifest = {
-            "schema_version": 1, "process_id": _PROCESS_ID,
+            "schema_version": 2, "process_id": _PROCESS_ID,
             "run_id": run_id, "folder_name": folder, "requested_name": folder_name,
             "node_id": str(node_id), **(context or {}), "settings": settings or {},
             "created_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
@@ -141,7 +144,7 @@ class PreviewArchiveSession:
         result.pop("process_id", None)
         return result
 
-    def save_step(self, step, data, metadata):
+    def save_step(self, step, data, metadata, audio_data=None, audio_metadata=None):
         if self._finalized:
             raise RuntimeError("Archive has already been finalized")
         if type(step) is not int or step < 1 or not data:
@@ -156,7 +159,15 @@ class PreviewArchiveSession:
         # finalization can still put it in the ZIP and retry the manifest.
         self.manifest["artifacts"].append(record)
         self.manifest["artifacts"].sort(key=lambda r: r["step"])
-        self.persist()
+        try:
+            if audio_data is not None:
+                audio_filename = f"Step{step:03d}.wav"
+                _atomic_write(contained(self.directory, self.directory / audio_filename), audio_data)
+                record["audio"] = {**(audio_metadata or {}), "filename": audio_filename,
+                                   "bytes": len(audio_data)}
+        finally:
+            # A failed WAV write must not hide an already complete WebP.
+            self.persist()
         return record
 
     def finalize(self, sampling_status, error_summary=None):
@@ -178,9 +189,10 @@ class PreviewArchiveSession:
                     if not self.manifest["artifacts"]:
                         bundle.writestr(name + "/", b"")
                     for record in self.manifest["artifacts"]:
-                        filename = f"Step{record['step']:03d}.webp"
-                        path = contained(self.directory, self.directory / filename)
-                        bundle.write(path, arcname=name + "/" + filename)
+                        for extension in ("webp", "wav") if record.get("audio") else ("webp",):
+                            filename = f"Step{record['step']:03d}.{extension}"
+                            path = contained(self.directory, self.directory / filename)
+                            bundle.write(path, arcname=name + "/" + filename)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, archive)

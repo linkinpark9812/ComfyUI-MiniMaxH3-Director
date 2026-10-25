@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Audio in sampling previews.** Connect the optional `audio_vae` input to save matching
+`StepNNN.webp`/`StepNNN.wav` pairs at the existing capture interval. The node has separate
+WebP and WAV downloads, synchronized playback with mute, and paired ZIP contents after
+completion or cancellation. Playback starts muted and uses real clip timing. Temporary
+MP4 playback copies share a single audio/video clock; archives retain the original files.
+Audio decoding adds preview work; failed audio captures preserve their video preview.
+
 **Downloadable sampling history.** Preview Override now saves animated WebPs at the
 configured `every_n_steps` interval (default every step), lists them beside the live
 preview, and creates a ZIP after sampling completes or is canceled. `archive_folder_name`

@@ -65,10 +65,12 @@ python test_preview_ui.py
 
 The archive suite uses standard-library filesystem tests, plus Pillow for real WebP
 encoding and a stubbed sampler. Install aiohttp to include its real HTTP download tests.
+PyAV and NumPy enable WAV encoding, real audio/video muxing, and paired download tests.
 The UI suite needs Pillow, aiohttp, Playwright, and Chrome (`MMX_TEST_BROWSER` can select
 another installed Playwright browser channel). It drives the actual extension and HTTP
 routes in a simulated ComfyUI host, including downloads, cancellation, reconnects, and
-resizing. These test dependencies are not new runtime requirements. A real H3 run in
+resizing; install PyAV and NumPy to include synchronized playback and mute checks.
+These test dependencies are not new runtime requirements. A real H3 run in
 ComfyUI is still needed to validate GPU decoding and the host's node layout.
 
 `test_plan.py` needs no server and no GPU — `minimax_plan` imports nothing but `json` and
