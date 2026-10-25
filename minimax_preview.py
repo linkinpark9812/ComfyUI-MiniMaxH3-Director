@@ -82,9 +82,19 @@ def _audio_stream(x0, latent_shapes=None):
     return streams[1] if len(streams) > 1 else None
 
 
-def _decode_audio_wav(vae, latent, duration):
+def _decode_audio_wav(vae, x0, duration, model, latent_shapes=None):
     from .minimax_preview_audio import encode_wav
 
+    if x0 is None:
+        raise ValueError("No H3 audio latent is available for this step")
+    # Callback x0 is still in sampler space. H3 scales the packed audio onto the
+    # video schedule; the final sampler output undoes this in process_latent_out.
+    # Apply that same model conversion BEFORE extracting audio, since it needs the
+    # full AV layout. Use private float32 storage so neither conversion nor VAE
+    # decoding can alter the sampler's callback tensors. NestedTensor has no detach.
+    source = x0 if getattr(x0, "is_nested", False) else x0.detach()
+    source = source.to(dtype=torch.float32, copy=True)
+    latent = _audio_stream(model.process_latent_out(source), latent_shapes)
     if latent is None or latent.ndim != 4:
         raise ValueError("No H3 audio latent is available for this step")
     # Use ComfyUI's own audio decoding/normalization and never lend it sampler storage.
@@ -388,8 +398,8 @@ class _OuterSampleWrapper:
                         if self.audio_vae is not None:
                             try:
                                 audio_data, audio_metadata = _decode_audio_wav(
-                                    self.audio_vae, _audio_stream(x0, kwargs.get("latent_shapes")),
-                                    pixel_frames / MODEL_FPS)
+                                    self.audio_vae, x0, pixel_frames / MODEL_FPS,
+                                    executor.class_obj.inner_model, kwargs.get("latent_shapes"))
                             except InterruptProcessingException:
                                 raise
                             except Exception as exc:

@@ -176,7 +176,7 @@ def load_preview_modules():
     modules[package_name + ".minimax_preview_archive"] = archive
     if preview_audio:
         modules[package_name + ".minimax_preview_audio"] = preview_audio
-    module("torch", Tensor=object)
+    module("torch", Tensor=object, float32="float32")
     module("torch.nn")
     module("torch.nn.functional")
     module("numpy")
@@ -263,7 +263,7 @@ class SamplerTests(unittest.TestCase):
 
         class Executor:
             class_obj = types.SimpleNamespace(model_patcher=types.SimpleNamespace(
-                model=types.SimpleNamespace(latent_format=None)))
+                model=types.SimpleNamespace(latent_format=None)), inner_model=object())
 
             def __call__(executor_self, noise, latent, sampler, sigmas, mask, callback, *args, **kwargs):
                 for step in range(30):
@@ -408,9 +408,13 @@ class SamplerTests(unittest.TestCase):
     def test_audio_capture_uses_same_step_and_survives_cancellation(self):
         wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
             512, 24, 24, 80, 1, True, "node", archive_folder_name="MyShot", audio_vae=object())
-        with patch.object(self.preview, "_decode_audio_wav", return_value=(b"wav", {"duration": 5 / 24})):
+        with patch.object(self.preview, "_decode_audio_wav", return_value=(b"wav", {"duration": 5 / 24})) as decode:
             with self.assertRaises(self.preview.InterruptProcessingException):
                 self.sample(wrapper=wrapper, stop=3, error=self.preview.InterruptProcessingException())
+        # The decoder must get the full callback latent and active model, not an
+        # already extracted audio stream whose sampler scale can no longer be undone.
+        self.assertEqual(decode.call_args.args[1].ndim, 5)
+        self.assertIsNotNone(decode.call_args.args[3])
         manifest, = self.manifests()
         self.assertEqual([a["audio"]["filename"] for a in manifest["artifacts"]],
                          ["Step001.wav", "Step002.wav", "Step003.wav"])
@@ -576,7 +580,7 @@ class AudioTests(unittest.TestCase):
                 self.assertEqual(bundle.namelist(), ["AudioShot/Step006.webp", "AudioShot/Step006.wav"])
                 self.assertEqual(bundle.read("AudioShot/Step006.wav"), wav)
 
-    def test_audio_decoder_receives_a_private_copy(self):
+    def test_audio_decode_matches_model_output_conversion_without_mutating_sampler(self):
         np = preview_audio.np
         modules, _, _ = load_preview_modules()
         preview = modules[0]
@@ -589,22 +593,64 @@ class AudioTests(unittest.TestCase):
             def __getitem__(self, key): return Tensor(self.data[key])
             def detach(self): return self
             def clone(self): return Tensor(self.data.copy())
+            def to(self, dtype, copy=False): return Tensor(self.data.astype(dtype, copy=copy))
             def float(self): return self
             def cpu(self): return self
             def numpy(self): return self.data
 
-        latent = Tensor(np.ones((1, 32, 2, 40), dtype=np.float32))
+        class Nested:
+            is_nested = True
 
-        def decode(vae, samples):
-            samples["samples"].data[:] = 99
-            return types.SimpleNamespace(args=[{"waveform": Tensor(np.zeros((1, 2, 32000))), "sample_rate": 32000}])
+            def __init__(self, tensors): self.tensors = tensors
+            def to(self, **kwargs): return Nested([t.to(**kwargs) for t in self.tensors])
 
-        nodes = types.SimpleNamespace(VAEDecodeAudio=types.SimpleNamespace(execute=decode))
-        with patch.object(preview, "audio_nodes", return_value=nodes):
-            data, meta = preview._decode_audio_wav(object(), latent, 1)
-        self.assertTrue((latent.data == 1).all())
-        self.assertEqual(meta["duration"], 1)
-        self.assertTrue(data.startswith(b"RIFF"))
+        video = np.arange(8, dtype=np.float32).reshape(1, 1, 2, 2, 2)
+        audio = np.linspace(-.5, .5, 32 * 2 * 40, dtype=np.float32).reshape(1, 32, 2, 40)
+        shapes = [video.shape, audio.shape]
+
+        def unpack(packed, shapes):
+            split = int(np.prod(shapes[0][1:]))
+            return [Tensor(packed.data[:, :split].reshape(shapes[0])),
+                    Tensor(packed.data[:, split:].reshape(shapes[1]))]
+
+        # Test schedule scaling and an additional model output transform: the
+        # preview must delegate the whole conversion, not hard-code an H3 ratio.
+        for nested in (False, True):
+            for scale in (1.0, 4.0, .25):
+                with self.subTest(nested=nested, scale=scale):
+                    streams = [Tensor(video.copy()), Tensor(audio * scale)]
+                    source = Nested(streams) if nested else Tensor(np.concatenate(
+                        [t.data.reshape(1, -1) for t in streams], axis=1))
+                    original = [t.data.copy() for t in streams] if nested else source.data.copy()
+                    expected = audio / 2 + .125
+
+                    def convert(private):
+                        parts = private.tensors if nested else unpack(private, shapes)
+                        self.assertEqual(parts[0].data.dtype, np.float32)
+                        np.testing.assert_array_equal(parts[0].data, video)
+                        parts[1].data[:] = parts[1].data / scale / 2 + .125
+                        parts[0].data[:] = -99  # Even an in-place model must be isolated.
+                        return private
+
+                    def decode(vae, samples):
+                        np.testing.assert_allclose(samples["samples"].data, expected)
+                        waveform = samples["samples"].data[:, 0].copy()
+                        samples["samples"].data[:] = 99  # Also isolate VAE writes.
+                        return types.SimpleNamespace(args=[{"waveform": Tensor(waveform), "sample_rate": 32000}])
+
+                    model = types.SimpleNamespace(process_latent_out=convert)
+                    nodes = types.SimpleNamespace(VAEDecodeAudio=types.SimpleNamespace(execute=decode))
+                    with patch.object(preview, "audio_nodes", return_value=nodes), \
+                         patch.object(preview.comfy.utils, "unpack_latents", side_effect=unpack, create=True):
+                        data, meta = preview._decode_audio_wav(object(), source, 40 / 32000, model, shapes)
+                    expected_wav, _ = preview_audio.encode_wav(expected[0, 0], 32000, 40 / 32000)
+                    self.assertEqual(data, expected_wav)
+                    self.assertEqual(meta["samples"], 40)
+                    if nested:
+                        for tensor, before in zip(source.tensors, original):
+                            np.testing.assert_array_equal(tensor.data, before)
+                    else:
+                        np.testing.assert_array_equal(source.data, original)
 
 
 if __name__ == "__main__":

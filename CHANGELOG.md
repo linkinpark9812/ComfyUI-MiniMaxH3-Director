@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**Fix garbled step audio.** Preview audio now applies the active model's
+`process_latent_out` conversion before VAE decoding, matching the final sampler output.
+Previously it decoded H3's scaled sampler audio directly. The conversion runs on a
+private copy; existing saved WAVs need a new run to be regenerated correctly.
+
 **Audio in sampling previews.** Connect the optional `audio_vae` input to save matching
 `StepNNN.webp`/`StepNNN.wav` pairs at the existing capture interval. The node has separate
 WebP and WAV downloads, synchronized playback with mute, and paired ZIP contents after
