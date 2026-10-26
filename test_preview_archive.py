@@ -326,6 +326,62 @@ class SamplerTests(unittest.TestCase):
         self.sample(interval=5)
         self.assertEqual([a["step"] for a in self.manifests()[0]["artifacts"]], [1, 6, 11, 16, 21, 26, 30])
 
+    def test_stop_at_step_limits_decode_and_capture_but_not_sampling(self):
+        for limit, interval, expected in (
+            (5, 1, [1, 2, 3, 4, 5]),
+            (1, 1, [1]),
+            (5, 5, [1]),
+            (6, 5, [1, 6]),
+            (29, 5, [1, 6, 11, 16, 21, 26]),
+            (30, 5, [1, 6, 11, 16, 21, 26, 30]),
+            (100, 5, [1, 6, 11, 16, 21, 26, 30]),
+            (-1, 5, [1, 6, 11, 16, 21, 26, 30]),
+        ):
+            with self.subTest(limit=limit, interval=interval):
+                wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_VAE, object(),
+                    512, 24, 24, 80, interval, True, "both", archive_folder_name="MyShot",
+                    audio_vae=object(), stop_at_step=limit)
+                self.events.clear()
+                with patch.object(self.preview, "_vae_decode") as video, \
+                     patch.object(self.preview, "_decode_audio_wav", return_value=(None, None)) as audio, \
+                     patch.object(self.preview, "_encode_animated_webp", return_value=b"encoded") as encode, \
+                     patch.object(self.preview._VHSStreamer, "send"):
+                    self.assertEqual(self.sample(wrapper=wrapper), "sampled")
+                for operation in (video, audio, encode):
+                    self.assertEqual(operation.call_count, len(expected))
+                finished = self.events[-1][1]
+                self.assertEqual([a["step"] for a in finished["artifacts"]], expected)
+                self.assertEqual(finished["sampling_status"], "completed")
+                self.assertEqual(finished["last_step"], 30)
+                self.assertEqual(self.callbacks, list(range(30)))
+
+    def test_zero_limit_skips_all_preview_setup_and_restores_suppression(self):
+        original = self.preview.latent_preview.LatentPreviewer.decode_latent_to_preview_image
+        for suppress in (False, True):
+            wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_VAE, None,
+                512, 24, 24, 80, 1, suppress, "both", audio_vae=object(), stop_at_step=0)
+            with patch.object(self.preview, "PreviewArchiveSession") as archive_session, \
+                 patch.object(self.preview, "_RGBFactors") as rgb, \
+                 patch.object(self.preview, "_vae_decode") as video, \
+                 patch.object(self.preview, "_decode_audio_wav") as audio:
+                self.assertEqual(self.sample(wrapper=wrapper), "sampled")
+                self.assertEqual(self.callbacks, list(range(30)))
+                for operation in (archive_session, rgb, video, audio):
+                    operation.assert_not_called()
+                self.assertEqual(self.events, [])
+                self.assertEqual(self.manifests(), [])
+
+                def executor(*args, **kwargs):
+                    previewer = self.preview.latent_preview.LatentPreviewer()
+                    self.assertEqual(previewer.decode_latent_to_preview_image(None, None),
+                                     None if suppress else "original")
+                    raise self.preview.InterruptProcessingException()
+
+                with self.assertRaises(self.preview.InterruptProcessingException):
+                    wrapper(executor, None, None, None, None, None, None, False, 42)
+                self.assertIs(self.preview.latent_preview.LatentPreviewer.decode_latent_to_preview_image,
+                              original)
+
     def test_cancel_preserves_zip_and_original_exception(self):
         exc = self.preview.InterruptProcessingException()
         original = self.preview.latent_preview.LatentPreviewer.decode_latent_to_preview_image
@@ -422,13 +478,17 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(self.events[-1][1]["archive_state"], "unavailable")
         self.assertTrue(next(Path(self.temp.name).rglob("MyShot.zip")).is_file())
 
-    def test_folder_widget_is_last_and_defaulted_in_execute(self):
+    def test_new_inputs_are_appended_and_defaulted_in_execute(self):
         import inspect
         node = self.preview.MiniMaxH3PreviewOverride
         schema = node.define_schema()
-        self.assertEqual(schema.inputs[-1].id, "audio_vae")
-        self.assertEqual(schema.inputs[-2].id, "archive_folder_name")
-        self.assertEqual(schema.inputs[-3].id, "playback")
+        self.assertEqual(schema.inputs[-1].id, "stop_at_step")
+        self.assertEqual(schema.inputs[-1].default, -1)
+        self.assertEqual(schema.inputs[-1].min, -1)
+        self.assertEqual(schema.inputs[-2].id, "audio_vae")
+        self.assertEqual(schema.inputs[-3].id, "archive_folder_name")
+        self.assertEqual(schema.inputs[-4].id, "playback")
+        self.assertEqual(inspect.signature(node.execute).parameters["stop_at_step"].default, -1)
         self.assertEqual(inspect.signature(node.execute).parameters["archive_folder_name"].default,
                          archive.DEFAULT_FOLDER)
 

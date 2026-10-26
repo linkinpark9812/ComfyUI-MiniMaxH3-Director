@@ -883,6 +883,7 @@ and renders the whole shot as it denoises.
 | `max_resolution` | Long edge of the preview image, as a **target** — latent2rgb frames arrive at latent size (a 1344×768 shot is an 84×48 grid), so this upscales them smoothly. |
 | `webp_quality` | Quality of the animation sent to the browser. |
 | `every_n_steps` | Save step 1, then every N steps, plus the final step. Default 1 saves every step. Filenames keep actual sampler step numbers. |
+| `stop_at_step` | Stop creating previews after this step, numbered from 1. Default `-1` has no limit; `0` disables preview capture and archives. For example, `5` allows captures through step 5, then skips video/audio decoding and encoding for the remaining steps. Sampling continues normally; `every_n_steps` and `suppress_default_preview` still apply. |
 | `max_preview_overhead` | Spaces **live display** updates using preview cost (default 25; 0 disables). Does not skip saved steps or cap total capture time. Use `every_n_steps` to reduce capture work. |
 | `suppress_default_preview` | Hides ComfyUI's built-in single-frame preview. |
 | `archive_folder_name` | Name inside the ZIP and under the output directory (default `MiniMaxH3-preview`). Each sampling invocation gets a separate run directory. |
@@ -923,7 +924,9 @@ ZIP contains one folder named by `archive_folder_name`, with `Step001.webp` and,
 audio is connected and encoding succeeds, `Step001.wav` and `Step001.mp4` beside it. Numbers have at
 least three digits and retain gaps: a 30-step run with
 `every_n_steps=5` saves steps **1, 6, 11, 16, 21, 26, 30**. The final callback is captured
-even when off cadence. Cancellation keeps completed captures; it cannot create an image
+even when off cadence, unless it exceeds `stop_at_step`. The cutoff does not force an
+extra capture off cadence: `every_n_steps=5` with `stop_at_step=5` saves only step 1.
+Cancellation keeps completed captures; it cannot create an image
 for a callback that did not finish.
 
 Files are saved automatically, even without a browser, under:

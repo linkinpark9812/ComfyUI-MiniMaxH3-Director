@@ -255,7 +255,7 @@ class _OuterSampleWrapper:
     def __init__(self, node_id, decode_mode, vae, max_resolution, preview_frames,
                  preview_fps, webp_quality, every_n_steps, suppress_default, target,
                  max_overhead=25, playback=None, archive_folder_name=DEFAULT_FOLDER,
-                 audio_vae=None):
+                 audio_vae=None, stop_at_step=-1):
         self.node_id = node_id
         self.decode_mode = decode_mode
         self.vae = vae
@@ -270,6 +270,7 @@ class _OuterSampleWrapper:
         self.playback = playback or PLAYBACK_TRUE
         self.archive_folder_name = archive_folder_name
         self.audio_vae = audio_vae
+        self.stop_at_step = int(stop_at_step)
 
     def _rate_for(self, shown, pixel_frames):
         """Frames per second to play `shown` images at.
@@ -292,6 +293,18 @@ class _OuterSampleWrapper:
 
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask,
                  callback, disable_pbar, seed, **kwargs):
+        if self.stop_at_step == 0:
+            # No preview setup, decoding, or archive I/O, but honor suppression.
+            original_decode = latent_preview.LatentPreviewer.decode_latent_to_preview_image
+            try:
+                if self.suppress_default:
+                    latent_preview.LatentPreviewer.decode_latent_to_preview_image = \
+                        lambda self_, preview_format, x0: None
+                return executor(noise, latent_image, sampler, sigmas, denoise_mask,
+                                callback, disable_pbar, seed, **kwargs)
+            finally:
+                latent_preview.LatentPreviewer.decode_latent_to_preview_image = original_decode
+
         # Resolve at sampling time, not execute(): the patched model may be cached.
         srv = server.PromptServer.instance
         context = get_executing_context()
@@ -321,7 +334,8 @@ class _OuterSampleWrapper:
             session = PreviewArchiveSession(
                 folder_paths.get_output_directory(), self.archive_folder_name, self.node_id,
                 {k: identity[k] for k in ("prompt_id", "sampler_id")},
-                {"every_n_steps": self.every_n_steps, "decode": self.decode_mode,
+                {"every_n_steps": self.every_n_steps, "stop_at_step": self.stop_at_step,
+                 "decode": self.decode_mode,
                  "preview_frames": self.preview_frames, "preview_fps": self.preview_fps,
                  "max_resolution": self.max_resolution, "webp_quality": self.webp_quality,
                  "playback": self.playback, "preview_target": self.target,
@@ -370,7 +384,8 @@ class _OuterSampleWrapper:
                 number = int(step) + 1
                 if session:
                     session.manifest.update(last_step=number, total_steps=int(total_steps))
-                eligible = step % self.every_n_steps == 0 or number == total_steps
+                within_limit = self.stop_at_step < 0 or number <= self.stop_at_step
+                eligible = within_limit and (step % self.every_n_steps == 0 or number == total_steps)
                 if eligible and number not in saved_steps:
                     started = time.monotonic()
                     try:
@@ -527,7 +542,8 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
                              tooltip="WebP quality of the animation sent to the node."),
                 io.Int.Input("every_n_steps", default=1, min=1, max=50, step=1, optional=True,
                              tooltip="Save step 1, then every N steps, plus the final step. "
-                                     "Filenames retain the actual step numbers. Default: every step."),
+                                     "All captures respect stop_at_step. Filenames retain the actual "
+                                     "step numbers. Default: every step."),
                 io.Int.Input("max_preview_overhead", default=25, min=0, max=100, step=5, optional=True,
                              tooltip="Spaces live display updates using preview cost (0 disables). "
                                      "Does not skip archive captures or cap total decoding time. "
@@ -556,6 +572,11 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
                              tooltip="Connect the MiniMax H3 audio VAE to save a WAV and H.264 MP4 for every "
                                      "captured step and enable synchronized, real-time AV playback. "
                                      "Adds audio decoding work. Leave disconnected for WebP only."),
+                io.Int.Input("stop_at_step", default=-1, min=-1, max=10000, step=1, optional=True,
+                             tooltip="Stop creating previews after this 1-based sampler step (inclusive). "
+                                     "-1: no limit; 0: no previews or archives. Skips video/audio decoding "
+                                     "and encoding after the limit, including the final step. "
+                                     "Sampling continues; every_n_steps and default-preview suppression still apply."),
             ],
             outputs=[io.Model.Output(tooltip="Model with the preview attached.")],
             hidden=[io.Hidden.unique_id],
@@ -565,8 +586,9 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
     def execute(cls, model, decode=DECODE_FAST, preview_target=TARGET_NODE, max_resolution=512,
                 preview_frames=24, preview_fps=24.0, playback=PLAYBACK_TRUE, webp_quality=80,
                 every_n_steps=1, max_preview_overhead=25, suppress_default_preview=True,
-                vae=None, archive_folder_name=DEFAULT_FOLDER, audio_vae=None) -> io.NodeOutput:
-        if decode == DECODE_VAE and vae is None:
+                vae=None, archive_folder_name=DEFAULT_FOLDER, audio_vae=None,
+                stop_at_step=-1) -> io.NodeOutput:
+        if stop_at_step != 0 and decode == DECODE_VAE and vae is None:
             raise ValueError(
                 "MiniMax H3 Preview Override: decode is set to 'vae (quality)' but no VAE is "
                 "connected. Wire minimax_h3_video_vae into 'vae', or switch decode back to "
@@ -577,7 +599,8 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
         wrapper = _OuterSampleWrapper(
             str(cls.hidden.unique_id), decode, vae, max_resolution, preview_frames,
             preview_fps, webp_quality, every_n_steps, suppress_default_preview,
-            preview_target, max_preview_overhead, playback, archive_folder_name, audio_vae)
+            preview_target, max_preview_overhead, playback, archive_folder_name, audio_vae,
+            stop_at_step=stop_at_step)
 
         # Register where the sampler actually looks: CFGGuider reads
         #   get_all_wrappers(OUTER_SAMPLE, self.model_options, is_model_options=True)
