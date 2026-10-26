@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Downloadable synchronized MP4 steps.** Each preview step with audio now also saves
+`StepNNN.mp4`, with its own download button and inclusion in the run ZIP. Exports use
+H.264 CRF 21 / slow, 320 kbps AAC, real clip timing, and the full captured preview
+resolution before WebP compression. The node reuses this file for playback. Encoding
+failures preserve the WebP/WAV pair, and completed exports survive cancellation.
+
 **Fix garbled step audio.** Preview audio now applies the active model's
 `process_latent_out` conversion before VAE decoding, matching the final sampler output.
 Previously it decoded H3's scaled sampler audio directly. The conversion runs on a

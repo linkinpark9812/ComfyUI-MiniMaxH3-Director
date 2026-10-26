@@ -200,11 +200,19 @@ function showPreview(panel, data) {
 }
 
 function addArtifact(panel, artifact) {
-  if (!Number.isInteger(artifact.step) || panel.artifacts.has(artifact.step)) return;
+  if (!Number.isInteger(artifact.step)) return;
+  const previous = panel.artifacts.get(artifact.step);
+  if (previous && JSON.stringify(previous) === JSON.stringify(artifact)) return;
+  // Reconnect/polling may see the WebP/WAV while MP4 encoding is still running.
+  // Update its controls when the export arrives without restarting playback.
+  if (previous) {
+    [...panel.list.children].find((row) => Number(row.dataset.step) === artifact.step)?.remove();
+  }
   panel.artifacts.set(artifact.step, artifact);
-  const row = element("div", { display: "flex", gap: "4px", alignItems: "center", padding: "3px 0" });
+  const row = element("div", { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gap: "4px", alignItems: "center", padding: "3px 0" });
   row.dataset.step = String(artifact.step);
-  const select = element("button", { ...CONTROL_STYLE, flex: "1", minWidth: "0",
+  const select = element("button", { ...CONTROL_STYLE, gridColumn: "1 / -1", minWidth: "0",
     textAlign: "left", overflow: "hidden", textOverflow: "ellipsis" }, artifact.filename);
   select.type = "button";
   select.title = `Inspect step ${artifact.step}`;
@@ -231,7 +239,20 @@ function addArtifact(panel, artifact) {
     wav.title = artifact.audio_error || "No audio saved for this step; connect audio_vae before running";
     wav.style.opacity = "0.4";
   }
-  row.append(select, download, wav);
+  const mp4 = element(artifact.mp4 ? "a" : "button", {
+    ...CONTROL_STYLE, color: "#8bcaff", textDecoration: "none",
+  }, "MP4");
+  if (artifact.mp4) {
+    mp4.href = api.apiURL(archiveURL(panel, "mp4", artifact.step, true));
+    mp4.download = artifact.mp4.filename;
+    mp4.title = `Download ${artifact.mp4.filename}`;
+    mp4.setAttribute("aria-label", mp4.title);
+  } else {
+    mp4.disabled = true;
+    mp4.title = artifact.mp4_error || "No MP4 saved for this step; connect audio_vae before running";
+    mp4.style.opacity = "0.4";
+  }
+  row.append(select, download, wav, mp4);
   const following = [...panel.list.children].find((r) => Number(r.dataset.step) > artifact.step);
   panel.list.insertBefore(row, following || null);
 }

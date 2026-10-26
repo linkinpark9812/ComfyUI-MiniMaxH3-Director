@@ -145,6 +145,33 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual((self.session.directory / "Step001.webp").read_bytes(), b"saved")
         self.assertFalse((self.session.directory / "MyShot.zip").exists())
 
+    def test_mp4_export_failure_keeps_pair_and_can_retry_before_finalization(self):
+        self.session.save_step(1000, b"webp", {}, b"wav", {})
+
+        def fail(*paths):
+            raise OSError("encoder failed")
+
+        with self.assertRaises(OSError):
+            self.session.save_mp4(1000, fail)
+        self.assertIn("mp4_error", self.session.snapshot()["artifacts"][0])
+        self.session.save_mp4(1000, lambda webp, wav, mp4: mp4.write_bytes(b"mp4"))
+        self.session.save_mp4(1000, fail)  # Already saved: do not encode twice.
+        result = self.session.finalize("interrupted")
+        self.assertNotIn("mp4_error", result["artifacts"][0])
+        with ZipFile(self.session.directory / "MyShot.zip") as bundle:
+            self.assertEqual(bundle.namelist(), [f"MyShot/Step1000.{ext}" for ext in ("webp", "wav", "mp4")])
+        with self.assertRaises(RuntimeError):
+            self.session.save_mp4(1000, fail)
+
+    def test_mp4_requires_listed_pair(self):
+        self.session.save_step(1, b"webp", {})
+        with self.assertRaises(ValueError):
+            self.session.save_mp4(1, lambda *paths: self.fail("Must not encode without audio"))
+        run_id = self.session.manifest["run_id"]
+        (self.session.directory / "Step001.mp4").write_bytes(b"unlisted")
+        with self.assertRaises(FileNotFoundError):
+            archive.artifact_path(self.temp.name, "MyShot", run_id, self.session.snapshot(), 1, "mp4")
+
     def test_restart_can_read_finalized_archive_and_detect_abandoned_run(self):
         self.session.save_step(1, b"saved", {})
         with patch.object(archive, "_PROCESS_ID", "new process"):
@@ -408,7 +435,13 @@ class SamplerTests(unittest.TestCase):
     def test_audio_capture_uses_same_step_and_survives_cancellation(self):
         wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
             512, 24, 24, 80, 1, True, "node", archive_folder_name="MyShot", audio_vae=object())
-        with patch.object(self.preview, "_decode_audio_wav", return_value=(b"wav", {"duration": 5 / 24})) as decode:
+        def build(webp, wav, destination, *, frames):
+            self.assertIs(frames, self.frames)
+            destination.write_bytes(b"mp4")
+
+        module = types.SimpleNamespace(build_av_export=build)
+        with patch.object(self.preview, "_decode_audio_wav", return_value=(b"wav", {"duration": 5 / 24})) as decode, \
+             patch.dict(sys.modules, {"preview_tests_package.minimax_preview_audio": module}):
             with self.assertRaises(self.preview.InterruptProcessingException):
                 self.sample(wrapper=wrapper, stop=3, error=self.preview.InterruptProcessingException())
         # The decoder must get the full callback latent and active model, not an
@@ -419,7 +452,26 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual([a["audio"]["filename"] for a in manifest["artifacts"]],
                          ["Step001.wav", "Step002.wav", "Step003.wav"])
         with ZipFile(next(Path(self.temp.name).rglob("MyShot.zip"))) as bundle:
-            self.assertEqual(len(bundle.namelist()), 6)
+            self.assertEqual(len(bundle.namelist()), 9)
+            self.assertEqual(bundle.read("MyShot/Step003.mp4"), b"mp4")
+
+    def test_mp4_encoding_failure_preserves_pairs_and_sampling(self):
+        wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
+            512, 24, 24, 80, 5, True, "node", archive_folder_name="MyShot", audio_vae=object())
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("encoder unavailable")
+
+        with patch.object(self.preview, "_decode_audio_wav", return_value=(b"wav", {"duration": 5 / 24})), \
+             patch.dict(sys.modules, {"preview_tests_package.minimax_preview_audio": types.SimpleNamespace(build_av_export=fail)}):
+            with self.assertLogs(self.preview.log, level="WARNING"):
+                self.assertEqual(self.sample(wrapper=wrapper), "sampled")
+        manifest, = self.manifests()
+        self.assertEqual(len(manifest["artifacts"]), 7)
+        self.assertTrue(all(a.get("audio") and a.get("mp4_error") and not a.get("mp4") for a in manifest["artifacts"]))
+        self.assertEqual(self.callbacks, list(range(30)))
+        with ZipFile(next(Path(self.temp.name).rglob("MyShot.zip"))) as bundle:
+            self.assertEqual(len(bundle.namelist()), 14)
 
     def test_audio_failure_keeps_video_steps(self):
         wrapper = self.preview._OuterSampleWrapper("7", self.preview.DECODE_FAST, None,
@@ -531,9 +583,85 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("été 東京/Step002.wav", bundle.namelist())
             self.assertFalse(any(n.endswith(".mp4") for n in bundle.namelist()))
 
+    @unittest.skipUnless(preview_audio, "PyAV and NumPy needed for MP4 export")
+    async def test_saved_mp4_download_playback_range_and_zip(self):
+        wav, meta = preview_audio.encode_wav(preview_audio.np.zeros((2, 32000)), 32000, 1)
+        self.session.save_step(6, self.data, {}, wav, meta)
+        frames = [Image.new("RGB", (32, 24), color) for color in ("red", "blue")]
+        self.session.save_mp4(6, lambda webp, wav, mp4:
+            preview_audio.build_av_export(webp, wav, mp4, frames=frames))
+        expected = (self.session.directory / "Step006.mp4").read_bytes()
+        response = await self.client.get(self.url("mp4", step=6, download=1))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, "video/mp4")
+        self.assertIn("attachment", response.headers["Content-Disposition"])
+        self.assertIn("Step006.mp4", response.headers["Content-Disposition"])
+        self.assertEqual(await response.read(), expected)
+        with patch.object(preview_audio, "build_av_preview", side_effect=AssertionError("Must reuse saved MP4")):
+            response = await self.client.get(self.url("playback", step=6), headers={"Range": "bytes=0-31"})
+            self.assertEqual(response.status, 206)
+            self.assertEqual(await response.read(), expected[:32])
+        response = await self.client.get(self.url("mp4", step=1))
+        self.assertEqual(response.status, 404)
+        response = await self.client.get(self.url("mp4", step="../secret"))
+        self.assertEqual(response.status, 400)
+        self.session.finalize("interrupted")
+        response = await self.client.get(self.url("zip"))
+        with ZipFile(io.BytesIO(await response.read())) as bundle:
+            self.assertEqual(bundle.read("été 東京/Step006.mp4"), expected)
+
 
 @unittest.skipUnless(preview_audio, "PyAV and NumPy needed for audio tests")
 class AudioTests(unittest.TestCase):
+    def test_mp4_export_preserves_full_frames_real_timing_and_audio(self):
+        np = preview_audio.np
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            t = np.arange(96000) / 48000
+            samples = np.stack([.2 * np.sin(t * 440 * 2 * np.pi), .1 * np.sin(t * 220 * 2 * np.pi)])
+            wav, _ = preview_audio.encode_wav(samples, 48000, 2)
+            (root / "step.wav").write_bytes(wav)
+            # Odd dimensions above the old 768px limit must be padded, never shrunk.
+            frames = [Image.new("RGB", (801, 451), color) for color in ("red", "blue")]
+            destination = root / "step.mp4"
+            preview_audio.build_av_export(root / "not-read.webp", root / "step.wav", destination, frames=frames)
+            raw = destination.read_bytes()
+            self.assertLess(raw.index(b"moov"), raw.index(b"mdat"))
+            with preview_audio.av.open(str(destination)) as container:
+                video, audio = container.streams.video[0], container.streams.audio[0]
+                self.assertEqual(video.codec_context.name, "h264")
+                self.assertEqual(audio.codec_context.name, "aac")
+                self.assertEqual((video.width, video.height), (802, 452))
+                self.assertEqual(video.pix_fmt, "yuv420p")
+                self.assertEqual(audio.codec_context.sample_rate, 48000)
+                self.assertAlmostEqual(float(video.duration * video.time_base), 2, delta=.05)
+                self.assertAlmostEqual(float(audio.duration * audio.time_base), 2, delta=.05)
+                decoded = list(container.decode(video))
+                self.assertEqual(len(decoded), 2)
+                self.assertAlmostEqual(float(decoded[1].pts * decoded[1].time_base), 1, delta=.01)
+                self.assertGreater(decoded[0].to_image().getpixel((400, 200))[0], 230)
+                self.assertGreater(decoded[1].to_image().getpixel((400, 200))[2], 230)
+            with preview_audio.av.open(str(destination)) as container:
+                decoded = np.concatenate([f.to_ndarray() for f in container.decode(audio=0)], axis=1)
+                # AAC is lossy; verify both distinct channels retain their waveform/timing.
+                for channel in range(2):
+                    self.assertGreater(np.corrcoef(decoded[channel, :96000], samples[channel])[0, 1], .98)
+            self.assertEqual(frames[0].size, (801, 451))
+            self.assertFalse(list(root.glob("*.part")))
+
+    def test_mp4_encoder_failure_does_not_publish_partial_file(self):
+        np = preview_audio.np
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            wav, _ = preview_audio.encode_wav(np.zeros((2, 32000)), 32000, 1)
+            (root / "step.wav").write_bytes(wav)
+            with patch.object(preview_audio.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    preview_audio.build_av_export(root / "unused.webp", root / "step.wav", root / "step.mp4",
+                                                  frames=[Image.new("RGB", (16, 16))])
+            self.assertFalse((root / "step.mp4").exists())
+            self.assertFalse(list(root.glob("*.part")))
+
     def test_wav_channels_timing_and_input_unchanged(self):
         import wave
         np = preview_audio.np

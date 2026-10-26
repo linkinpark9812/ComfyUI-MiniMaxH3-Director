@@ -51,10 +51,14 @@ async def _preview_archive_response(request, kind):
         manifest = await asyncio.to_thread(read_manifest, output_root, folder, run_id)
         if kind == "manifest":
             return web.json_response(manifest, headers={"Cache-Control": "no-store"})
-        step = int(request.query.get("step", "")) if kind in ("step", "audio", "playback") else None
-        extension = "wav" if kind == "audio" else "webp"
+        step = int(request.query.get("step", "")) if kind in ("step", "audio", "mp4", "playback") else None
+        extension = {"audio": "wav", "mp4": "mp4"}.get(kind, "webp")
+        saved_mp4 = kind == "playback" and any(
+            record["step"] == step and record.get("mp4") for record in manifest["artifacts"])
+        if saved_mp4:
+            extension = "mp4"
         path = await asyncio.to_thread(artifact_path, output_root, folder, run_id, manifest, step, extension)
-        if kind == "playback":
+        if kind == "playback" and not saved_mp4:
             from pathlib import Path
             from .minimax_preview_audio import build_av_preview
 
@@ -82,7 +86,7 @@ async def _preview_archive_response(request, kind):
     disposition = "attachment" if download else "inline"
     return web.FileResponse(path, headers={
         "Content-Type": {"zip": "application/zip", "step": "image/webp",
-                         "audio": "audio/wav", "playback": "video/mp4"}[kind],
+                         "audio": "audio/wav", "mp4": "video/mp4", "playback": "video/mp4"}[kind],
         "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(path.name, safe='')}",
         "X-Content-Type-Options": "nosniff",
     })
@@ -106,6 +110,11 @@ async def preview_archive_audio(request):
 @PromptServer.instance.routes.get("/minimax_director/preview_archive/playback")
 async def preview_archive_playback(request):
     return await _preview_archive_response(request, "playback")
+
+
+@PromptServer.instance.routes.get("/minimax_director/preview_archive/mp4")
+async def preview_archive_mp4(request):
+    return await _preview_archive_response(request, "mp4")
 
 
 @PromptServer.instance.routes.get("/minimax_director/preview_archive/zip")

@@ -95,10 +95,11 @@ def artifact_path(output_root, folder, run_id, manifest, step=None, extension="w
     else:
         if type(step) is not int or step < 1:
             raise ValueError("Invalid step")
-        if extension not in ("webp", "wav"):
+        if extension not in ("webp", "wav", "mp4"):
             raise ValueError("Invalid preview file type")
         record = next((r for r in manifest["artifacts"] if r["step"] == step), None)
-        if record is None or (extension == "wav" and not record.get("audio")):
+        if (record is None or (extension == "wav" and not record.get("audio"))
+                or (extension == "mp4" and not record.get("mp4"))):
             raise FileNotFoundError("Step was not saved")
         filename = f"Step{step:03d}.{extension}"
     path = contained(directory, directory / filename)
@@ -123,7 +124,7 @@ class PreviewArchiveSession:
             except FileExistsError:
                 continue
         self.manifest = {
-            "schema_version": 2, "process_id": _PROCESS_ID,
+            "schema_version": 3, "process_id": _PROCESS_ID,
             "run_id": run_id, "folder_name": folder, "requested_name": folder_name,
             "node_id": str(node_id), **(context or {}), "settings": settings or {},
             "created_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
@@ -170,6 +171,34 @@ class PreviewArchiveSession:
             self.persist()
         return record
 
+    def save_mp4(self, step, build):
+        """Publish an encoded AV export for a saved pair before ZIP finalization.
+
+        The injected encoder atomically writes its destination. Storage stays independent
+        of codecs; a failed MP4 must not discard an already saved WebP/WAV pair.
+        """
+        if self._finalized:
+            raise RuntimeError("Archive has already been finalized")
+        if type(step) is not int or step < 1:
+            raise ValueError("A positive step is required")
+        record = next((r for r in self.manifest["artifacts"] if r["step"] == step), None)
+        if record is None or not record.get("audio"):
+            raise ValueError("A saved WebP/WAV pair is required for MP4 export")
+        if record.get("mp4"):
+            return record
+        paths = [contained(self.directory, self.directory / f"Step{step:03d}.{ext}")
+                 for ext in ("webp", "wav", "mp4")]
+        try:
+            build(*paths)
+            record["mp4"] = {"filename": paths[2].name, "bytes": paths[2].stat().st_size}
+            record.pop("mp4_error", None)
+        except Exception as exc:
+            record["mp4_error"] = str(exc) or type(exc).__name__
+            raise
+        finally:
+            self.persist()
+        return record
+
     def finalize(self, sampling_status, error_summary=None):
         if self._finalized:
             return self.snapshot()
@@ -189,7 +218,12 @@ class PreviewArchiveSession:
                     if not self.manifest["artifacts"]:
                         bundle.writestr(name + "/", b"")
                     for record in self.manifest["artifacts"]:
-                        for extension in ("webp", "wav") if record.get("audio") else ("webp",):
+                        extensions = ["webp"]
+                        if record.get("audio"):
+                            extensions.append("wav")
+                        if record.get("mp4"):
+                            extensions.append("mp4")
+                        for extension in extensions:
                             filename = f"Step{record['step']:03d}.{extension}"
                             path = contained(self.directory, self.directory / filename)
                             bundle.write(path, arcname=name + "/" + filename)

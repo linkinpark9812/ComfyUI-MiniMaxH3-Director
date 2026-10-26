@@ -412,6 +412,18 @@ class _OuterSampleWrapper:
                                 record = session.save_step(number, data, metadata,
                                                            audio_data, audio_metadata)
                                 saved_steps.add(number)
+                                if record.get("audio"):
+                                    try:
+                                        from .minimax_preview_audio import build_av_export
+
+                                        session.save_mp4(number, lambda webp, wav, destination:
+                                            build_av_export(webp, wav, destination, frames=frames))
+                                    except InterruptProcessingException:
+                                        raise
+                                    except Exception as exc:
+                                        failure(number, RuntimeError(f"MP4 export: {exc}"))
+                                record["ms"] = int((time.monotonic() - started) * 1000)
+                                session.persist()
                                 emit("step_saved", {"artifact": record})
                             except InterruptProcessingException:
                                 raise
@@ -541,7 +553,7 @@ class MiniMaxH3PreviewOverride(io.ComfyNode):
                                 tooltip="Folder name inside the ZIP and under ComfyUI output. "
                                         "Each run is stored separately. Not a server path."),
                 io.Vae.Input("audio_vae", optional=True,
-                             tooltip="Connect the MiniMax H3 audio VAE to save a WAV for every "
+                             tooltip="Connect the MiniMax H3 audio VAE to save a WAV and H.264 MP4 for every "
                                      "captured step and enable synchronized, real-time AV playback. "
                                      "Adds audio decoding work. Leave disconnected for WebP only."),
             ],

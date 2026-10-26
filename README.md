@@ -886,10 +886,10 @@ and renders the whole shot as it denoises.
 | `max_preview_overhead` | Spaces **live display** updates using preview cost (default 25; 0 disables). Does not skip saved steps or cap total capture time. Use `every_n_steps` to reduce capture work. |
 | `suppress_default_preview` | Hides ComfyUI's built-in single-frame preview. |
 | `archive_folder_name` | Name inside the ZIP and under the output directory (default `MiniMaxH3-preview`). Each sampling invocation gets a separate run directory. |
-| `audio_vae` (optional input) | Connect the MiniMax H3 audio VAE to save a matching WAV at each captured step and hear it in the node preview. Leave disconnected for WebP only. |
+| `audio_vae` (optional input) | Connect the MiniMax H3 audio VAE to save a matching WAV and synchronized H.264 MP4 at each captured step and hear it in the node preview. Leave disconnected for WebP only. |
 
 The right-hand list keeps each saved step. Click a filename to inspect that
-step, **WebP** or **WAV** to download its files, or **Live** to return to live playback. History
+step, **WebP**, **WAV**, or **MP4** to download its files, or **Live** to return to live playback. History
 updates do not restart the animation on the left. With `sampler (VHS)`, files are still
 saved and listed; live playback remains in the sampler. Synchronized audio playback is
 available in this node when inspecting a saved step, or live with target `node`/`both`.
@@ -903,16 +903,24 @@ the WAV always uses real clip timing. Audio capture uses the same `every_n_steps
 as video, and paired previews use the first batch item. The WAV is PCM16 at the audio
 VAE's output sample rate, with its tail trimmed or padded to the shot duration.
 
-For browser playback, the server creates an H.264/AAC copy from the saved pair, capped
-at 768 pixels on the long edge. These copies are cached under
-`<ComfyUI temp>/MiniMaxH3-preview-av/` and excluded from the ZIP. Original WebP/WAV files
-keep their saved quality. If audio decoding fails, the WebP remains available and the
-WAV button is disabled with the error in its tooltip. A browser playback failure falls
-back to the animated WebP; the original downloads remain available.
+Each captured step with audio also saves `StepNNN.mp4`: H.264 at **CRF 21**, the **slow**
+encoding preset, browser-compatible YUV420p, and **320 kbps AAC** audio. It uses the
+original captured preview frames before WebP compression, at the full resolution set by
+`max_resolution`. Odd dimensions are padded by one pixel as needed for H.264. The MP4
+matches the WAV's real duration regardless of the WebP playback setting. Preview frame
+thinning and decode mode still determine the available motion and image detail.
+
+The node plays the saved MP4 directly, and the same file is available through its download
+button and inside the ZIP. MP4 encoding happens during capture, including headless runs,
+and adds CPU processing time and disk usage. If audio decoding fails, WebP remains available;
+if MP4 encoding fails, the WebP/WAV pair remains available. Unavailable downloads are disabled
+with the error in their tooltips. Older runs without saved MP4s can still play using a
+temporary 768-pixel H.264/AAC copy under `<ComfyUI temp>/MiniMaxH3-preview-av/`; those
+temporary copies are excluded from the ZIP. A browser playback failure falls back to WebP.
 
 **Download all (.zip)** becomes available after sampling finishes or is canceled. The
 ZIP contains one folder named by `archive_folder_name`, with `Step001.webp` and, when
-audio is connected and decoded successfully, `Step001.wav` beside it. Numbers have at
+audio is connected and encoding succeeds, `Step001.wav` and `Step001.mp4` beside it. Numbers have at
 least three digits and retain gaps: a 30-step run with
 `every_n_steps=5` saves steps **1, 6, 11, 16, 21, 26, 30**. The final callback is captured
 even when off cadence. Cancellation keeps completed captures; it cannot create an image
@@ -924,8 +932,10 @@ Files are saved automatically, even without a browser, under:
 <ComfyUI output>/MiniMaxH3/previews/<folder name>/<unique run ID>/
   Step001.webp
   Step001.wav  (with audio_vae connected)
+  Step001.mp4  (synchronized video/audio)
   Step006.webp
   Step006.wav
+  Step006.mp4
   ...
   <folder name>.zip
   manifest.json
@@ -940,11 +950,11 @@ even if downstream video decoding or muxing is still running.
 
 **Capture now follows the requested interval exactly.** Previously the overhead cap and
 animation playback could skip steps even with interval 1. These controls now throttle
-only live presentation. Video and audio VAE capture at every step can add substantial processing time;
+only live presentation. Video/audio decoding and MP4 encoding at every step can add substantial processing time;
 raise `every_n_steps`, or reduce `preview_frames`/`max_resolution`, to reduce the cost.
 Individual files and their ZIP both occupy disk space; remove old run directories manually
 when no longer needed. Graceful cancellation finalizes the ZIP. A server crash or full
-disk may prevent finalization; already saved WebPs/WAVs remain, and archive errors are shown
+disk may prevent finalization; already saved WebPs/WAVs/MP4s remain, and archive errors are shown
 instead of advertising a complete ZIP. Reloading the browser starts with an empty panel;
 prior runs remain on disk.
 

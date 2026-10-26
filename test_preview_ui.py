@@ -210,6 +210,13 @@ class PreviewBrowserTests(unittest.IsolatedAsyncioTestCase):
         await self.emit("step_saved", {"artifact": record})
         await self.emit("display", {"artifact": record}, event="minimax_h3_preview")
         await self.page.wait_for_function("node._mmxPreview.video.readyState >= 2")
+        # Poll/reconnect can observe the pair before its export finishes. The later
+        # notification must enable MP4 without adding a row or restarting playback.
+        source = await self.page.locator("#node video").get_attribute("src")
+        self.session.save_mp4(6, preview_audio.build_av_export)
+        await self.emit("step_saved", {"artifact": record})
+        self.assertEqual(await self.page.locator("[data-step]").count(), 1)
+        self.assertEqual(await self.page.locator("#node video").get_attribute("src"), source)
         self.assertTrue(await self.page.evaluate("node._mmxPreview.video.muted"))
         duration = await self.page.evaluate("node._mmxPreview.video.duration")
         self.assertAlmostEqual(duration, 2, delta=.06)
@@ -222,12 +229,17 @@ class PreviewBrowserTests(unittest.IsolatedAsyncioTestCase):
         file = await download.value
         self.assertEqual(file.suggested_filename, "Step006.wav")
         self.assertEqual(Path(await file.path()).read_bytes(), wav)
+        async with self.page.expect_download() as download:
+            await self.page.get_by_role("link", name="Download Step006.mp4", exact=True).click()
+        file = await download.value
+        self.assertEqual(file.suggested_filename, "Step006.mp4")
+        self.assertEqual(Path(await file.path()).read_bytes(), (self.session.directory / "Step006.mp4").read_bytes())
         await self.emit("finished", self.session.finalize("interrupted"))
         async with self.page.expect_download() as download:
             await self.page.get_by_role("button", name="Download all (.zip)", exact=True).click()
         file = await download.value
         with ZipFile(await file.path()) as bundle:
-            self.assertEqual(bundle.namelist(), ["My Shot 東京/Step006.webp", "My Shot 東京/Step006.wav"])
+            self.assertEqual(bundle.namelist(), [f"My Shot 東京/Step006.{ext}" for ext in ("webp", "wav", "mp4")])
         screenshot = os.environ.get("MMX_TEST_SCREENSHOT")
         if screenshot:
             await self.page.screenshot(path=str(Path(screenshot).with_stem("preview-audio")))
